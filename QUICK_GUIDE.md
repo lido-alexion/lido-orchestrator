@@ -6,51 +6,75 @@ Copy the relevant prompt into the supervisor conversation. For takeover or recov
 
 ## Register
 
-> Register yourself with Lido Orchestrator and enable event-driven supervision while retaining hourly fallback.
+```text
+Register yourself with Lido Orchestrator and enable event-driven supervision while retaining hourly fallback.
+```
 
 ## Deboard
 
-> Gracefully deboard yourself from Lido Orchestrator, preserving all task history and evidence.
+```text
+Gracefully deboard yourself from Lido Orchestrator, preserving all task history and evidence.
+```
 
 ## Take over
 
-> Take over supervisor `<supervisor-id>` from Lido Orchestrator. Recover its context, pending tasks and active workers, and continue its work.
+```text
+Take over supervisor <supervisor-id> from Lido Orchestrator. Recover its context, pending tasks and active workers, and continue its work.
+```
 
 ## Recover deleted chat
 
-> Recover the orphaned supervisor `<supervisor-id>` from Lido Orchestrator and resume its assigned responsibilities.
+```text
+Recover the orphaned supervisor <supervisor-id> from Lido Orchestrator and resume its assigned responsibilities.
+```
 
 ## List supervisors
 
-> List all registered Lido Orchestrator supervisors, their responsibilities, health and current status.
+```text
+List all registered Lido Orchestrator supervisors, their responsibilities, health and current status.
+```
 
 ## Check progress
 
-> Check current status.
+```text
+Check current status.
+```
 
 ## Continue
 
-> Continue with the remaining work.
+```text
+Continue with the remaining work.
+```
 
 ## Suspend
 
-> Temporarily suspend yourself in Lido Orchestrator without losing task state or history.
+```text
+Temporarily suspend yourself in Lido Orchestrator without losing task state or history.
+```
 
 ## Resume
 
-> Resume your Lido Orchestrator supervision and continue pending work.
+```text
+Resume your Lido Orchestrator supervision and continue pending work.
+```
 
 ## Clean up orphaned registrations
 
-> Inspect all stale and orphaned Lido Orchestrator supervisors and safely deactivate abandoned registrations. Preserve pending work and history.
+```text
+Inspect all stale and orphaned Lido Orchestrator supervisors and safely deactivate abandoned registrations. Preserve pending work and history.
+```
 
 ## Finish work
 
-> Verify all acceptance criteria and complete your assigned work. Deboard when completion is verified and lifecycle authorization permits.
+```text
+Verify all acceptance criteria and complete your assigned work. Deboard when completion is verified and lifecycle authorization permits.
+```
 
 ## Integration health
 
-> Verify your Lido Orchestrator registration, event triggers, hourly fallback and worker associations.
+```text
+Verify your Lido Orchestrator registration, event triggers, hourly fallback and worker associations.
+```
 
 ## Rules
 
