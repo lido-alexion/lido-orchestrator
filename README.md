@@ -1,5 +1,7 @@
 # Lido Orchestrator
 
+Before every supervisor execution, follow the mandatory [SUPERVISOR_PROTOCOL.md](SUPERVISOR_PROTOCOL.md). The twelve [QUICK_GUIDE.md](QUICK_GUIDE.md) prompts are examples only; check [ONBOARDING.md](ONBOARDING.md) and installed `lido supervisor --help` for supported operations.
+
 Install the local package and CLI with `python3.12 -m pip install .`; the installed command is `lido`. Runtime state stays in the SQLite path selected by `--db` or `LIDO_DB`.
 
 A small local supervisor for event-driven project automation. Python 3.12, standard library only. The CLI and service use SQLite and are **dry-run by default**. The built-in Codex adapter is read-only and uses a new empty scratch project. A separate workspace-write adapter contract is present for disposable non-production repositories, but there is no verified OS isolation backend and the adapter is not wired into the CLI or service. Writable execution is therefore disabled.
@@ -33,6 +35,12 @@ Real dispatch has a fail-closed crash policy. The supervisor durably marks an in
 ### Generic event delivery
 
 An external adapter can claim due outbox rows with `claim-outbox OWNER`. SQLite leases each row atomically and returns an attempt-scoped claim token. The consumer sends the event, then acknowledges with `ack-outbox EVENT_ID --claim-token TOKEN`; on failure it calls `retry-outbox EVENT_ID TOKEN`, which schedules capped exponential backoff. Expired claims become eligible for redelivery. Delivery is at least once: consumers must deduplicate by stable event id, including when a send succeeded but its acknowledgement was lost. Tokens fence stale acknowledgements and retries. The local CLI is trusted-user only; these tokens are not user authentication.
+
+### Supervisor recovery
+
+Takeover fences old credentials and work. A trusted-local operator can adopt a specific never-dispatched pending task with `supervisor adopt TASK_ID TARGET_SUPERVISOR --actor OPERATOR`; the target must be active and own the same project. Adoption is atomic and audited, always returns the task to `awaiting_approval`, and rejects attempted work, dispatch history, and unresolved dependencies. For a deboarded supervisor, register a replacement ID in the same project first; deboarded IDs cannot be reactivated. Use `supervisor dispose TASK_ID --actor OPERATOR --reason REASON` to cancel a pending task and its descendants only when every task has zero attempts and no dispatch history. Any ambiguous task rejects the whole disposition. Ambiguous in-flight work is never replayed.
+
+Worker completion events are accepted through trusted in-process adapter callbacks. There is no CLI event injection command, authenticated callback endpoint, or multi-user authorization layer.
 
 `lido_orchestrator.event_transport` provides a minimal HMAC-SHA256 envelope helper for an embedding transport that supplies its own key. The helper checks a short timestamp window, canonical signature, size, identifiers, and bounded text fields. It does not obtain or persist keys, send events, open a listener, or parse email. Any email body or other external text remains untrusted data; callers must not treat it as authorization or executable instructions. Use a synthetic transport and disposable database to exercise delivery before connecting any external source.
 
@@ -74,7 +82,7 @@ Live transport has not been exercised by this phase. If an operator later verifi
 
 ### Isolated non-production planning and handoff pilot
 
-This opt-in pilot exercises one approved read-only planning task and one immediately handed-off read-only follow-up in a disposable database. Codex runs in its empty per-task scratch directory; it never receives the registered project root. Run only from a normal user shell with the configured Codex CLI available. The pilot explicitly enables the real adapter and preapproved read-only handoff. Never run it under a service or against production data, credentials, external accounts, or another supervisor. Keep the database until its audit has been inspected:
+This opt-in pilot exercises one approved read-only planning task and one immediately handed-off read-only follow-up in a disposable database. Codex runs in its empty per-task scratch directory; it never receives the registered project root. Run only from a normal user shell with the configured Codex CLI available. The pilot explicitly enables the real adapter and preapproved read-only handoff. Never run it under a pinned service or against production systems, credentials, external accounts, or another supervisor. Keep the database until its audit has been inspected:
 
 ```sh
 pilot_dir=$(mktemp -d)
@@ -117,7 +125,7 @@ For non-production integration, use a temporary database and a fake `WorkerAdapt
 
 No `ProjectIsolation` backend is shipped or verified in this repository. The write adapter is not available from the CLI or service, and a project authorization alone cannot enable it. Do not run an actual writable pilot or deploy writable execution. Cross-supervisor launch/termination is now serialized for adapters dispatched through the Engine: the durable `dispatching` marker precedes the launch-fenced SQLite transaction, which rechecks authority before adapter launch. This does not provide cross-supervisor process killing after launch; terminated running work is marked `needs_review`, while each worker can only cancel its own local process tree. The standalone write adapter is still disconnected from this fence and remains disabled.
 
-A future isolated writable pilot needs independently reviewed OS denial of host and credential reads and network, project-only writes, cleanup and resource quotas, a minimized mount profile, a narrowly scoped authentication design, a short actor/reason write grant, and a manual deployment gate. Keep writable integration disabled until every prerequisite is evidenced.
+Host inspection on 2026-11-26 found `/usr/bin/bwrap`, bubblewrap 0.9.0, on Linux 6.8. Availability/version was checked without running a container or changing host settings. Namespace functionality and denial behavior were not tested. The current profile accepts a launcher based on its filename rather than a pinned identity and mounts all of `/usr` read-only, which exposes a broad host tree. Neither parser checks nor fake-launcher tests prove host or credential inaccessibility. A future isolated writable pilot needs: (1) a disposable non-production root with no credentials/data; (2) pinned launcher identity and independently tested OS denial of host/credential reads and network, project-only writes, cleanup and resource quotas; (3) a minimized mount profile; (4) an approved narrowly scoped authentication design that does not expose credentials to the worker; (5) a short actor/reason write grant; (6) independent review; and (7) a manual deployment gate. No production roots, credentials, containers, host settings, or actual writable tasks were touched for this phase. Keep writable integration disabled until every prerequisite is evidenced. Do not modify the existing service unit for a pilot.
 
 The intended synthetic workflow is a planning task, one approved read-only child, then a terminal `stop`. Use a temporary SQLite file, a fake local worker, `workflow_budget=2`, `workflow_max_depth=1`, and a short deadline. Inspect `workflows`, `tasks`, `events`, and `audit` before deleting that temporary state. Include a runaway fake response proposing two extra children and verify both the durable budget and restart leave no runnable descendant. This validates orchestration only; it is not evidence of OS isolation or writable Codex execution.
 
@@ -131,9 +139,19 @@ For a ChatGPT hourly supervisor, use one shared local database and invoke read-o
 
 Project roots are metadata, not sandbox enforcement. The Codex adapter enforces isolation by never using those roots and by selecting Codex's read-only sandbox; it does not provide a general writable project worker. The CLI is intended for a trusted local user; it has no authentication, network API, secret store, or multi-user authorization. Do not expose its database to an untrusted user. Use backups and restrictive filesystem permissions.
 
-## Service deployment
+## Dry-run service deployment
 
-This source package does not install or activate a service. Review the deployment environment and keep any service dry-run until a separate operator review approves a concrete unit and state directory. The CLI remains available for local manual reconciliation.
+The example service is intentionally dry-run and is not installed or activated by this project. Review [the user service unit](examples/lido-orchestrator.user.service), install the package in the account that will own the database, create its state directory, then copy the unit into `~/.config/systemd/user/`. For UID 1000, make the user manager environment explicit when needed:
+
+```sh
+export XDG_RUNTIME_DIR=/run/user/1000
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+systemctl --user daemon-reload
+systemctl --user start lido-orchestrator.service
+systemctl --user status lido-orchestrator.service
+```
+
+These values apply only when the service is managed by UID 1000's user systemd manager and that runtime bus exists. The service has no `--codex` flag and remains dry-run. Review logs and `status` before any separately approved change to the unit.
 
 ## Checks
 
@@ -141,4 +159,4 @@ This source package does not install or activate a service. Review the deploymen
 python3.12 -m unittest discover -s tests -v
 ```
 
-See [PUBLIC_RELEASE_CHECKLIST.md](PUBLIC_RELEASE_CHECKLIST.md) for this candidate's exact allowlist, file hashes, and release gates.
+See [STATUS.md](STATUS.md) for the implementation boundary, test results, and next steps.

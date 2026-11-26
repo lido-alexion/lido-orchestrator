@@ -169,7 +169,7 @@ class EngineTests(unittest.TestCase):
         token_a=b"fixture-token-a-0123456789abcdef"; token_b=b"fixture-token-b-0123456789abcdef"
         self.e.register_supervisor("sup-a","demo","worker-a",token_hash=hashlib.sha256(token_a).hexdigest())
         self.e.register_supervisor("sup-b","other","worker-b",token_hash=hashlib.sha256(token_b).hexdigest())
-        tid=self.e.submit("demo","synthetic",approval_required=False); self.e.reconcile(); self.e.ingest_event("sup-event",tid,"failed",{"note":"authoritative"})
+        tid=self.e.submit("demo","synthetic",approval_required=False,supervisor_id="sup-a"); self.e.reconcile(); self.e.ingest_event("sup-event",tid,"failed",{"note":"authoritative"})
         issued=int(self.clock.now); kind="worker.escalation"
         sig=hmac.new(token_a,f"sup-a\nsup-event\n{kind}\n{issued}".encode(),hashlib.sha256).hexdigest()
         routed=self.e.route_supervisor_event("sup-a","sup-event",issued=issued,signature=sig,token=token_a.decode())
@@ -199,13 +199,17 @@ class EngineTests(unittest.TestCase):
                     with patch("sys.stdin",io.StringIO(stdin)): main(["--db",str(db),*args])
             return json.loads(output.getvalue())
         invoke(["register-project","cli-demo",str(root)])
+        configured=invoke(["--supervisor-stale-seconds","10","--supervisor-inactive-seconds","20","--supervisor-orphan-seconds","40","info"])
+        self.assertEqual((10,20,40),(configured["defaults"]["supervisor_lease_stale_seconds"],configured["defaults"]["supervisor_inactive_seconds"],configured["defaults"]["supervisor_orphan_seconds"]))
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()): invoke(["--supervisor-stale-seconds","20","--supervisor-inactive-seconds","10","--supervisor-orphan-seconds","40","info"])
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()): invoke(["supervisor","register","cli-sup","cli-demo","worker-cli"])
         enrolled=invoke(["supervisor","register","cli-sup","cli-demo","worker-cli","--trusted-local"])
         token=enrolled["route_token_once"]
         engine=Engine(db,dry_run=False)
         try:
-            task=engine.submit("cli-demo","fixture",approval_required=False); engine.reconcile(); engine.ingest_event("cli-route-event",task,"failed",{"fixture":True})
+            task=engine.submit("cli-demo","fixture",approval_required=False,supervisor_id="cli-sup"); engine.reconcile(); engine.ingest_event("cli-route-event",task,"failed",{"fixture":True})
         finally: engine.close()
         issued=int(time.time()); kind="worker.escalation"
         signature=hmac.new(token.encode(),f"cli-sup\ncli-route-event\n{kind}\n{issued}".encode(),hashlib.sha256).hexdigest()
