@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lido-orchestrator"
+version = "0.1.0"
+description = "Local durable Codex workflow supervisor"
+requires-python = ">=3.12"
+
+[project.scripts]
+lido = "lido_orchestrator.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lido_orchestrator*"]
