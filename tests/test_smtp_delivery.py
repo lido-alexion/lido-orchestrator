@@ -58,6 +58,7 @@ class SMTPDeliveryTests(unittest.TestCase):
             def acquire_smtp_delivery_slot(self, **kwargs): return {"token":"slot", "wait_seconds":0}
             def release_smtp_delivery_slot(self, token): pass
             def claim_outbox(self, **kwargs): return [item]
+            def supervisor_outbox_eligible(self, *args): return True
             def acknowledge_outbox(self, *args, **kwargs): self.acked = args[0]
             def retry_outbox(self, *args, **kwargs): self.failed = True
         engine = EngineStub()
@@ -140,6 +141,7 @@ SMTP_SUBJECT_PREFIX=[LIDO-WAKE]
             def claim_outbox(self, **kwargs):
                 self.kwargs = kwargs
                 return [item]
+            def supervisor_outbox_eligible(self, *args): return True
             def acknowledge_outbox(self, *args, **kwargs): raise AssertionError("refused mail must not acknowledge")
             def retry_outbox(self, *args, **kwargs): self.retried = True
         class RefusingSMTP(FakeSMTP):
@@ -173,7 +175,10 @@ SMTP_SUBJECT_PREFIX=[LIDO-WAKE]
             engine=Engine(db,dry_run=False)
             try:
                 engine.register_project("demo",temp)
-                task=engine.submit("demo","fixture event",approval_required=False)
+                token="fixture-supervisor-token-012345678901234567890123456789"
+                engine.register_supervisor("fixture-supervisor","demo","fixture-worker",token_hash=hashlib.sha256(token.encode()).hexdigest())
+                engine.bind_supervisor_recipient("fixture-supervisor","supervisor@example.invalid",actor="fixture")
+                task=engine.submit("demo","fixture event",approval_required=False,supervisor_id="fixture-supervisor")
                 engine.reconcile()
                 engine.ingest_event("pilot-event",task,"failed",{"attempt":1})
             finally: engine.close()

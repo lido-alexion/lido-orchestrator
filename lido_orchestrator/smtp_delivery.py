@@ -71,7 +71,7 @@ def parse_config(text: str) -> SMTPConfig:
         host, sender = values["host"], values["sender"]
         recipients = tuple(values["recipients"].split(","))
         if (not re.fullmatch(r"(?=.{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*", host)
-                or not _valid_address(sender) or not recipients or len(recipients) > 50
+                or not _valid_address(sender) or not recipients or len(recipients) != 1
                 or any(not _valid_address(addr) for addr in recipients)):
             raise ValueError
         port = int(values["port"]); timeout = float(values["timeout"]); interval = float(values["min_interval"])
@@ -132,11 +132,15 @@ def _valid_address(value: str) -> bool:
     return bool(re.fullmatch(atom, local) and re.fullmatch(rf"{label}(?:\.{label})*", domain))
 
 
-def make_receipt(event_id: str, event_type: str, key: bytes, *, now: int | None = None, lifetime: int = 900) -> str:
+def make_receipt(event_id: str, event_type: str, key: bytes, *, recipient: str | None = None,
+                 now: int | None = None, lifetime: int = 900) -> str:
     if not event_id or len(event_id) > 200 or not event_type or len(event_type) > 100 or len(key) < 32 or not 1 <= lifetime <= 86400:
+        raise ValueError("invalid receipt parameters")
+    if recipient is not None and not _valid_address(recipient):
         raise ValueError("invalid receipt parameters")
     issued = int(time.time() if now is None else now)
     body = {"event_id": event_id, "event_type": event_type, "issued": issued, "expires": issued + lifetime}
+    if recipient is not None: body["recipient"] = recipient
     encoded = _b64(json.dumps(body, sort_keys=True, separators=(",", ":")).encode())
     sig = _b64(hmac.new(key, encoded.encode("ascii"), hashlib.sha256).digest())
     return encoded + "." + sig
@@ -150,9 +154,11 @@ def verify_receipt(token: str, key: bytes, *, now: int | None = None) -> dict[st
         if len(key) < 32 or not hmac.compare_digest(signature, expected): raise ValueError
         body = json.loads(_unb64(encoded))
         current = int(time.time() if now is None else now)
-        if (set(body) != {"event_id", "event_type", "issued", "expires"} or not isinstance(body["event_id"], str)
+        if (set(body) not in ({"event_id", "event_type", "issued", "expires"},
+                              {"event_id", "event_type", "issued", "expires", "recipient"}) or not isinstance(body["event_id"], str)
                 or not body["event_id"] or len(body["event_id"]) > 200 or not isinstance(body["event_type"], str)
                 or not body["event_type"] or len(body["event_type"]) > 100
+                or ("recipient" in body and (not isinstance(body["recipient"], str) or not _valid_address(body["recipient"])))
                 or body["expires"] < current or body["issued"] > current + 60 or body["expires"] <= body["issued"]
                 or body["expires"] - body["issued"] > 86400): raise ValueError
         body["token_id"] = hashlib.sha256(token.encode()).hexdigest()
@@ -181,7 +187,7 @@ class SMTPOutboxAdapter:
             return 0
         items = self.engine.claim_outbox(owner="smtp-adapter", limit=1,
             lease_seconds=min(5000, max(60, int(self.config.timeout * 8 + self.config.min_interval + 10))),
-            event_types=("worker.escalation", "worker.supervisor_decision"))
+            event_types=("worker.escalation", "worker.supervisor_decision"), recipient=self.config.recipients[0])
         if not items: return 0
         item = items[0]
         slot = self.engine.acquire_smtp_delivery_slot(
@@ -207,8 +213,12 @@ class SMTPOutboxAdapter:
 
     def _send(self, item: dict[str, Any]) -> None:
         event_id = item["id"]
+        if len(self.config.recipients) != 1:
+            raise RuntimeError("SMTP bridge delivery requires exactly one target recipient")
+        if item.get("event_type") not in ("worker.escalation", "worker.supervisor_decision") or not self.engine.supervisor_outbox_eligible(event_id, self.config.recipients[0], item.get("event_type")):
+            raise RuntimeError("SMTP event is not eligible for this active supervisor recipient")
         receipt = make_receipt(event_id.removeprefix("worker:"), item["event_type"], self.config.receipt_key,
-                               now=int(self.clock()))
+                               recipient=self.config.recipients[0], now=int(self.clock()))
         msg = EmailMessage()
         msg["From"], msg["To"] = self.config.sender, ", ".join(self.config.recipients)
         msg["Subject"] = f"{self.config.subject_prefix} {item['event_type']}"

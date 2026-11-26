@@ -37,7 +37,8 @@ class Engine:
                  worker: WorkerAdapter | None = None, clock=time.time,
                  fault_hook=None, allow_preapproved_read_only_steps: bool = False,
                  workflow_budget: int = 8, workflow_max_depth: int = 3,
-                 workflow_timeout: int = 3600):
+                 workflow_timeout: int = 3600, supervisor_stale_seconds: int = 10800,
+                 supervisor_inactive_seconds: int = 21600, supervisor_orphan_seconds: int = 86400):
         if not 1 <= max_concurrency <= 64 or not 1 <= lease_seconds <= 3600:
             raise ValueError("concurrency must be 1–64 and lease duration 1–3600 seconds")
         if not 1 <= workflow_budget <= self.MAX_WORKFLOW_TASKS or not 0 <= workflow_max_depth <= self.MAX_WORKFLOW_DEPTH or not 1 <= workflow_timeout <= self.MAX_WORKFLOW_SECONDS:
@@ -48,6 +49,11 @@ class Engine:
         self.allow_preapproved_read_only_steps = allow_preapproved_read_only_steps
         self.workflow_budget, self.workflow_max_depth = workflow_budget, workflow_max_depth
         self.workflow_timeout = workflow_timeout
+        if not 1 <= supervisor_stale_seconds <= supervisor_inactive_seconds <= supervisor_orphan_seconds <= 31_536_000:
+            raise ValueError("supervisor lifecycle thresholds must be positive, ordered, and at most one year")
+        self.supervisor_stale_seconds = supervisor_stale_seconds
+        self.supervisor_inactive_seconds = supervisor_inactive_seconds
+        self.supervisor_orphan_seconds = supervisor_orphan_seconds
         self.max_dispatches: int | None = None
         self._dispatch_count = 0
         self.fault_hook = fault_hook
@@ -80,6 +86,9 @@ class Engine:
           worker_id TEXT NOT NULL, token_hash TEXT NOT NULL, created REAL NOT NULL, revoked REAL);
         CREATE TABLE IF NOT EXISTS supervisor_routes(supervisor_id TEXT NOT NULL REFERENCES supervisors(id),
           event_id TEXT NOT NULL REFERENCES events(id), routed REAL NOT NULL, PRIMARY KEY(supervisor_id,event_id));
+        CREATE TABLE IF NOT EXISTS supervisor_recipients(recipient TEXT PRIMARY KEY,
+          supervisor_id TEXT NOT NULL REFERENCES supervisors(id), enabled INTEGER NOT NULL DEFAULT 1,
+          created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
           kind TEXT NOT NULL, payload TEXT NOT NULL, received REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, event_type TEXT NOT NULL,
@@ -99,6 +108,11 @@ class Engine:
         CREATE INDEX IF NOT EXISTS tasks_sched ON tasks(status,available_at,created);
         CREATE INDEX IF NOT EXISTS tasks_lease ON tasks(status,lease_until);
         """)
+        supcols = {r[1] for r in self.db.execute("PRAGMA table_info(supervisors)")}
+        for name, decl in (("generation", "INTEGER NOT NULL DEFAULT 1"), ("heartbeat", "REAL"),
+                           ("lifecycle", "TEXT NOT NULL DEFAULT 'active'"), ("lifecycle_since", "REAL")):
+            if name not in supcols: self.db.execute(f"ALTER TABLE supervisors ADD COLUMN {name} {decl}")
+        self.db.execute("UPDATE supervisors SET heartbeat=created WHERE heartbeat IS NULL AND revoked IS NULL")
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(dispatch_intents)")}
         if "claimed" not in columns: self.db.execute("ALTER TABLE dispatch_intents ADD COLUMN claimed REAL")
         outbox_columns = {r[1] for r in self.db.execute("PRAGMA table_info(outbox)")}
@@ -108,6 +122,9 @@ class Engine:
             if name not in outbox_columns:
                 self.db.execute(f"ALTER TABLE outbox ADD COLUMN {name} {declaration}")
         task_columns = {r[1] for r in self.db.execute("PRAGMA table_info(tasks)")}
+        if "supervisor_id" not in task_columns: self.db.execute("ALTER TABLE tasks ADD COLUMN supervisor_id TEXT REFERENCES supervisors(id)")
+        if "supervisor_generation" not in task_columns: self.db.execute("ALTER TABLE tasks ADD COLUMN supervisor_generation INTEGER")
+        self.db.execute("UPDATE tasks SET supervisor_generation=(SELECT generation FROM supervisors WHERE supervisors.id=tasks.supervisor_id) WHERE supervisor_id IS NOT NULL AND supervisor_generation IS NULL")
         if "parent_task_id" not in task_columns: self.db.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT REFERENCES tasks(id)")
         if "decision" not in task_columns: self.db.execute("ALTER TABLE tasks ADD COLUMN decision TEXT")
         if "workflow_id" not in task_columns: self.db.execute("ALTER TABLE tasks ADD COLUMN workflow_id TEXT")
@@ -204,7 +221,7 @@ class Engine:
                 raise
 
     def claim_outbox(self, *, owner: str, limit: int = 20, lease_seconds: int = 60,
-                     event_types: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+                     event_types: tuple[str, ...] | None = None, recipient: str | None = None) -> list[dict[str, Any]]:
         """Lease due events atomically. Delivery is at least once; consumers dedupe by id."""
         if not owner.strip() or not 1 <= limit <= 100 or not 1 <= lease_seconds <= 5000:
             raise ValueError("owner, limit (1–100), and lease (1–5000s) are required")
@@ -219,6 +236,9 @@ class Engine:
                 if event_types is not None:
                     sql += " AND event_type IN (" + ",".join("?" for _ in event_types) + ")"
                     params += tuple(event_types)
+                if recipient is not None:
+                    sql += " AND EXISTS (SELECT 1 FROM events e JOIN tasks t ON t.id=e.task_id JOIN supervisors s ON s.id=t.supervisor_id JOIN supervisor_recipients r ON r.supervisor_id=s.id WHERE e.id=substr(outbox.id,8) AND r.recipient=? AND r.enabled=1 AND t.supervisor_generation=s.generation AND s.revoked IS NULL AND s.lifecycle='active' AND COALESCE(s.heartbeat,s.created)+?>?)"
+                    params += (recipient, self.supervisor_stale_seconds, now)
                 rows = self.db.execute(sql + " ORDER BY created LIMIT ?", params + (limit,)).fetchall()
                 result = []
                 for row in rows:
@@ -261,6 +281,17 @@ class Engine:
                 if self.db.in_transaction: self.db.execute("ROLLBACK")
                 raise
 
+    def supervisor_outbox_eligible(self, event_id: str, recipient: str, event_type: str | None = None) -> bool:
+        """Check current lifecycle, generation, task scope, and exact delivery binding."""
+        now = self.clock()
+        allowed = ("worker.escalation", "worker.supervisor_decision")
+        if event_type is not None and event_type not in allowed: return False
+        sql = "SELECT 1 FROM outbox o JOIN events e ON e.id=substr(o.id,8) JOIN tasks t ON t.id=e.task_id JOIN supervisors s ON s.id=t.supervisor_id JOIN supervisor_recipients r ON r.supervisor_id=s.id WHERE o.id=? AND o.event_type IN (?,?) AND r.recipient=? AND r.enabled=1 AND t.supervisor_generation=s.generation AND s.revoked IS NULL AND s.lifecycle='active' AND COALESCE(s.heartbeat,s.created)+?>?"
+        params = (event_id, *allowed, recipient, self.supervisor_stale_seconds, now)
+        if event_type is not None:
+            sql += " AND o.event_type=?"; params += (event_type,)
+        return self.db.execute(sql, params).fetchone() is not None
+
     def acknowledge_outbox(self, event_id: str, *, actor: str, claim_token: str | None = None):
         if not actor.strip(): raise ValueError("actor required")
         with self._lock:
@@ -296,30 +327,260 @@ class Engine:
     def register_supervisor(self, supervisor_id: str, project_id: str, worker_id: str, *, token_hash: str):
         if not supervisor_id.strip() or not worker_id.strip() or len(supervisor_id)>100 or len(worker_id)>100 or len(token_hash)!=64:
             raise ValueError("invalid supervisor registration")
+        try: int(token_hash, 16)
+        except (TypeError, ValueError): raise ValueError("invalid supervisor registration") from None
         if not self.db.execute("SELECT 1 FROM projects WHERE id=?",(project_id,)).fetchone(): raise ValueError("unknown project")
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            self.db.execute("INSERT INTO supervisors VALUES(?,?,?,?,?,NULL)",(supervisor_id,project_id,worker_id,token_hash,self.clock()))
+            now=self.clock()
+            self.db.execute("INSERT INTO supervisors(id,project_id,worker_id,token_hash,created,revoked,generation,heartbeat,lifecycle,lifecycle_since) VALUES(?,?,?,?,?,NULL,1,?,'active',?)",
+                            (supervisor_id,project_id,worker_id,token_hash,now,now,now))
             self._audit("supervisor_registered",supervisor_id,{"project_id":project_id,"worker_id":worker_id,"trusted_local":True})
             self.db.execute("COMMIT")
         except Exception: self.db.execute("ROLLBACK"); raise
 
     def list_supervisors(self):
-        return [dict(r) for r in self.db.execute("SELECT id,project_id,worker_id,created,revoked FROM supervisors ORDER BY id")]
+        return [self._supervisor_view(r) for r in self.db.execute("SELECT * FROM supervisors ORDER BY id")]
 
-    def supervisor_status(self, supervisor_id: str):
-        row=self.db.execute("SELECT id,project_id,worker_id,created,revoked FROM supervisors WHERE id=?",(supervisor_id,)).fetchone()
-        if not row: raise ValueError("unknown supervisor")
-        result=dict(row); result["routed_events"]=self.db.execute("SELECT COUNT(*) FROM supervisor_routes WHERE supervisor_id=?",(supervisor_id,)).fetchone()[0]
+    def _supervisor_view(self, row):
+        result = dict(row)
+        result["observed_lifecycle"] = result["lifecycle"]
+        if result["revoked"] is not None: result["observed_lifecycle"] = "deboarded"
+        elif result["lifecycle"] in ("active", "stale", "inactive"):
+            age = self.clock() - (result["heartbeat"] if result["heartbeat"] is not None else result["created"])
+            if age >= self.supervisor_orphan_seconds: result["observed_lifecycle"] = "orphaned"
+            elif age >= self.supervisor_inactive_seconds: result["observed_lifecycle"] = "inactive"
+            elif age >= self.supervisor_stale_seconds: result["observed_lifecycle"] = "stale"
+        result.pop("token_hash", None)
         return result
 
-    def unregister_supervisor(self, supervisor_id: str, *, actor: str):
+    def _supervisor_is_live(self, row, now: float, *, allow_recovery: bool = False) -> bool:
+        age = now - (row["heartbeat"] if row["heartbeat"] is not None else row["created"])
+        allowed = ("active", "stale") if allow_recovery else ("active",)
+        limit = self.supervisor_inactive_seconds if allow_recovery else self.supervisor_stale_seconds
+        return row["revoked"] is None and row["lifecycle"] in allowed and age < limit
+
+    def supervisor_status(self, supervisor_id: str):
+        row=self.db.execute("SELECT * FROM supervisors WHERE id=?",(supervisor_id,)).fetchone()
+        if not row: raise ValueError("unknown supervisor")
+        result=self._supervisor_view(row); result["routed_events"]=self.db.execute("SELECT COUNT(*) FROM supervisor_routes WHERE supervisor_id=?",(supervisor_id,)).fetchone()[0]
+        result["ownership_ledger"]=[{"task_id":r["id"],"status":r["status"],"owner_generation":r["supervisor_generation"],"pending_approval":r["status"]=="awaiting_approval",
+            "in_flight":r["status"]=="running","last_updated":r["updated"],
+            "next_action":"review old-generation work and explicitly reassign if authorized" if r["supervisor_generation"] != result["generation"] else "inspect ambiguous result" if r["status"]=="needs_review" else "review approval" if r["status"]=="awaiting_approval" else "verify completion" if r["status"] in ("succeeded","dry_run","failed","cancelled") else "continue authorized supervision"}
+            for r in self.db.execute("SELECT id,status,updated,supervisor_generation FROM tasks WHERE supervisor_id=? ORDER BY created",(supervisor_id,))]
+        return result
+
+    def supervisor_heartbeat(self, supervisor_id: str, *, token: str, generation: int | None = None) -> dict:
+        with self._lock:
+            return self._supervisor_heartbeat(supervisor_id, token=token, generation=generation)
+
+    def _supervisor_heartbeat(self, supervisor_id: str, *, token: str, generation: int | None = None) -> dict:
+        import hashlib, hmac
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            changed=self.db.execute("UPDATE supervisors SET revoked=? WHERE id=? AND revoked IS NULL",(self.clock(),supervisor_id)).rowcount
-            if not changed: raise ValueError("unknown or revoked supervisor")
-            self._audit("supervisor_revoked",supervisor_id,{"actor":actor}); self.db.execute("COMMIT")
-        except Exception: self.db.execute("ROLLBACK"); raise
+            row=self.db.execute("SELECT * FROM supervisors WHERE id=?",(supervisor_id,)).fetchone()
+            age = self.clock() - (row["heartbeat"] if row and row["heartbeat"] is not None else row["created"] if row else 0)
+            if (not row or row["revoked"] is not None or row["lifecycle"] not in ("active", "stale") or age >= self.supervisor_inactive_seconds
+                or (generation is not None and generation != row["generation"])
+                or not isinstance(token,str) or not hmac.compare_digest(row["token_hash"],hashlib.sha256(token.encode()).hexdigest())):
+                raise ValueError("supervisor heartbeat rejected")
+            now=self.clock(); self.db.execute("UPDATE supervisors SET heartbeat=?,lifecycle='active',lifecycle_since=? WHERE id=? AND generation=?",(now,now,supervisor_id,row["generation"]))
+            self._audit("supervisor_heartbeat",supervisor_id,{"generation":row["generation"]})
+            self.db.execute("COMMIT")
+            return {"supervisor_id":supervisor_id,"generation":row["generation"],"heartbeat":now,"lease_until":now+self.supervisor_stale_seconds}
+        except Exception:
+            if self.db.in_transaction: self.db.execute("ROLLBACK")
+            raise
+
+    def supervisor_lifecycle(self, supervisor_id: str, *, action: str, actor: str, token_hash: str | None = None) -> dict:
+        with self._lock:
+            return self._supervisor_lifecycle(supervisor_id, action=action, actor=actor, token_hash=token_hash)
+
+    def _supervisor_lifecycle(self, supervisor_id: str, *, action: str, actor: str, token_hash: str | None = None) -> dict:
+        if not actor.strip() or action not in {"suspend","resume","complete","deboard","takeover"}: raise ValueError("invalid lifecycle action")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row=self.db.execute("SELECT * FROM supervisors WHERE id=?",(supervisor_id,)).fetchone()
+            if not row or row["revoked"] is not None: raise ValueError("unknown or deboarded supervisor")
+            if action == "resume" and row["lifecycle"] != "suspended": raise ValueError("supervisor is not suspended")
+            if action == "takeover":
+                try:
+                    if not isinstance(token_hash, str) or len(token_hash) != 64: raise ValueError
+                    int(token_hash, 16)
+                except (TypeError, ValueError): raise ValueError("takeover requires a rotated token digest") from None
+            if action == "complete" and self.db.execute("SELECT 1 FROM tasks WHERE supervisor_id=? AND status NOT IN ('succeeded','dry_run','cancelled') LIMIT 1",(supervisor_id,)).fetchone():
+                raise ValueError("supervisor has unfinished owned tasks or pending approvals")
+            now=self.clock(); generation=row["generation"]
+            if action == "takeover":
+                generation += 1
+                lifecycle="active"
+                self.db.execute("UPDATE supervisors SET generation=?,token_hash=?,heartbeat=?,lifecycle=?,lifecycle_since=? WHERE id=?",(generation,token_hash,now,lifecycle,now,supervisor_id))
+                # Running work is ambiguous across ownership transfer; hold it for inspection.
+                self._hold_supervisor_tasks(supervisor_id, now, "supervisor takeover requires in-flight review")
+                self._hold_ready_supervisor_tasks(supervisor_id, now, "supervisor generation changed; explicit reassignment required")
+            elif action == "deboard":
+                lifecycle="deboarded"
+                self.db.execute("UPDATE supervisors SET revoked=?,lifecycle=?,lifecycle_since=? WHERE id=?",(now,lifecycle,now,supervisor_id))
+                self.db.execute("UPDATE supervisor_recipients SET enabled=0 WHERE supervisor_id=?",(supervisor_id,))
+            else:
+                lifecycle={"suspend":"suspended","resume":"active","complete":"completed"}[action]
+                self.db.execute("UPDATE supervisors SET lifecycle=?,lifecycle_since=?,heartbeat=CASE WHEN ?='active' THEN ? ELSE heartbeat END WHERE id=?",(lifecycle,now,lifecycle,now,supervisor_id))
+            if action in ("suspend","complete","deboard"):
+                self._hold_supervisor_tasks(supervisor_id, now, "supervisor lifecycle changed; inspect in-flight task")
+                if action == "deboard":
+                    self._hold_ready_supervisor_tasks(supervisor_id, now, "supervisor deboarded; explicit reassignment required")
+            self._audit("supervisor_"+action,supervisor_id,{"actor":actor,"generation":generation})
+            self.db.execute("COMMIT"); return self.supervisor_status(supervisor_id)
+        except Exception:
+            if self.db.in_transaction: self.db.execute("ROLLBACK")
+            raise
+
+    def reap_supervisors(self, *, actor: str) -> list[dict]:
+        with self._lock:
+            return self._reap_supervisors(actor=actor)
+
+    def _reap_supervisors(self, *, actor: str) -> list[dict]:
+        if not actor.strip(): raise ValueError("trusted-local actor required")
+        now=self.clock(); changed=[]
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            rows=self.db.execute("SELECT * FROM supervisors WHERE revoked IS NULL AND lifecycle IN ('active','stale','inactive')").fetchall()
+            for row in rows:
+                age=now-(row["heartbeat"] if row["heartbeat"] is not None else row["created"])
+                target="orphaned" if age>=self.supervisor_orphan_seconds else "inactive" if age>=self.supervisor_inactive_seconds else "stale" if age>=self.supervisor_stale_seconds else None
+                if target and target != row["lifecycle"]:
+                    self.db.execute("UPDATE supervisors SET lifecycle=?,lifecycle_since=? WHERE id=?",(target,now,row["id"]))
+                    if target in ("inactive","orphaned"):
+                        self.db.execute("UPDATE supervisor_recipients SET enabled=0 WHERE supervisor_id=?",(row["id"],))
+                        self._hold_supervisor_tasks(row["id"], now, "supervisor lease expired; missing heartbeat is not proof of deletion")
+                        self._hold_ready_supervisor_tasks(row["id"], now, "supervisor lease expired; explicit reassignment required")
+                    self._audit("supervisor_lease_reaped",row["id"],{"actor":actor,"lifecycle":target,"age_seconds":age}); changed.append({"supervisor_id":row["id"],"lifecycle":target})
+            self.db.execute("COMMIT"); return changed
+        except Exception:
+            if self.db.in_transaction: self.db.execute("ROLLBACK")
+            raise
+
+    def _hold_supervisor_tasks(self, supervisor_id: str, now: float, reason: str):
+        running=self.db.execute("SELECT id FROM tasks WHERE supervisor_id=? AND status='running'",(supervisor_id,)).fetchall()
+        for task in running:
+            self.db.execute("UPDATE tasks SET status='needs_review',lease_owner=NULL,lease_until=NULL,last_error=?,updated=? WHERE id=?",(reason,now,task["id"]))
+            self.db.execute("UPDATE dispatch_intents SET state='ambiguous',claimed=NULL WHERE task_id=?",(task["id"],))
+            cancel=getattr(self.worker,"cancel",None)
+            if cancel:
+                try: cancel(task["id"])
+                except Exception as exc: self._audit("supervisor_cancel_failed",task["id"],{"error":str(exc)[:500]})
+
+    def _hold_ready_supervisor_tasks(self, supervisor_id: str, now: float, reason: str):
+        rows=self.db.execute("SELECT id FROM tasks WHERE supervisor_id=? AND status='ready'",(supervisor_id,)).fetchall()
+        for row in rows:
+            self.db.execute("UPDATE tasks SET status='needs_review',last_error=?,updated=? WHERE id=? AND status='ready'",(reason,now,row["id"]))
+            self._audit("supervisor_ready_task_held",row["id"],{"supervisor_id":supervisor_id,"reason":reason})
+
+    def adopt_supervisor_task(self, task_id: str, supervisor_id: str, *, actor: str) -> dict:
+        """Explicitly adopt a never-dispatched pending task into a live generation.
+
+        This is intentionally narrower than retry/replay: any attempt, dispatch
+        intent, unresolved dependency, or terminal task makes adoption ineligible.
+        Previously approved work returns to the approval queue.
+        """
+        if not actor.strip(): raise ValueError("trusted-local actor required")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            task=self.db.execute("SELECT * FROM tasks WHERE id=?",(task_id,)).fetchone()
+            target=self.db.execute("SELECT * FROM supervisors WHERE id=?",(supervisor_id,)).fetchone()
+            now=self.clock()
+            if not task or not target or target["revoked"] is not None or target["lifecycle"]!="active" or now-(target["heartbeat"] if target["heartbeat"] is not None else target["created"])>=self.supervisor_stale_seconds:
+                raise ValueError("adoption requires an existing task and active target supervisor lease")
+            if task["project_id"] != target["project_id"]: raise ValueError("adoption target must own the same project")
+            if self.db.execute("SELECT 1 FROM dispatch_intents WHERE task_id=?",(task_id,)).fetchone():
+                raise ValueError("task has dispatch history and cannot be adopted")
+            if task["status"] not in ("needs_review","awaiting_approval","ready") or task["attempts"] != 0:
+                raise ValueError("only never-dispatched pending work can be adopted")
+            if task["parent_task_id"] and self.db.execute("SELECT 1 FROM tasks WHERE id=? AND status='succeeded'",(task["parent_task_id"],)).fetchone() is None:
+                raise ValueError("task dependency is unresolved; resolve or dispose its workflow first")
+            prior_owner=task["supervisor_id"]
+            prior_generation=task["supervisor_generation"]
+            if prior_owner == supervisor_id and task["supervisor_generation"] == target["generation"]:
+                raise ValueError("task already belongs to the target generation")
+            # A live prior owner must explicitly retire, lose its lease, or be
+            # taken over before another supervisor may claim its work. This
+            # prevents an operator typo from silently splitting ownership.
+            if prior_owner is not None:
+                prior=self.db.execute("SELECT * FROM supervisors WHERE id=?",(prior_owner,)).fetchone()
+                if (prior and prior["generation"] == prior_generation and prior["revoked"] is None
+                        and prior["lifecycle"] == "active"
+                        and now-(prior["heartbeat"] if prior["heartbeat"] is not None else prior["created"]) < self.supervisor_stale_seconds):
+                    raise ValueError("prior owner is active; retire or take over its generation before adoption")
+            # Always require a fresh explicit approval after ownership changes.
+            changed=self.db.execute("UPDATE tasks SET supervisor_id=?,supervisor_generation=?,status='awaiting_approval',approval_required=1,lease_owner=NULL,lease_until=NULL,updated=?,last_error=NULL WHERE id=? AND supervisor_id IS ? AND supervisor_generation IS ? AND status=? AND attempts=0 AND NOT EXISTS (SELECT 1 FROM dispatch_intents WHERE task_id=?)",
+                            (supervisor_id,target["generation"],now,task_id,prior_owner,prior_generation,task["status"],task_id)).rowcount
+            if not changed: raise ValueError("task ownership changed concurrently; reload and explicitly reassess")
+            self._audit("supervisor_task_adopted",task_id,{"actor":actor,"from_supervisor":prior_owner,"from_generation":task["supervisor_generation"],"to_supervisor":supervisor_id,"to_generation":target["generation"],"approval_required":True})
+            self.db.execute("COMMIT")
+            return self.get_task(task_id)
+        except Exception:
+            if self.db.in_transaction: self.db.execute("ROLLBACK")
+            raise
+
+    def dispose_supervisor_task(self, task_id: str, *, actor: str, reason: str) -> list[str]:
+        """Audited cancellation for pending work proven never dispatched."""
+        if not actor.strip() or not reason.strip(): raise ValueError("trusted-local actor and disposition reason are required")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            rows=self.db.execute("""WITH RECURSIVE tree(id,parent_task_id,status,attempts) AS (
+                SELECT id,parent_task_id,status,attempts FROM tasks WHERE id=?
+                UNION SELECT t.id,t.parent_task_id,t.status,t.attempts FROM tasks t JOIN tree p ON t.parent_task_id=p.id)
+                SELECT * FROM tree""",(task_id,)).fetchall()
+            if not rows: raise ValueError("unknown task")
+            for row in rows:
+                if row["status"] not in ("needs_review","awaiting_approval","ready") or row["attempts"] != 0 or self.db.execute("SELECT 1 FROM dispatch_intents WHERE task_id=?",(row["id"],)).fetchone():
+                    raise ValueError("task tree contains attempted or ambiguous work and cannot be disposed")
+            now=self.clock()
+            disposed=[]
+            for row in rows:
+                self.db.execute("UPDATE tasks SET status='cancelled',approval_required=0,lease_owner=NULL,lease_until=NULL,last_error=?,updated=? WHERE id=?",
+                                ("trusted-local disposition: "+reason[:500],now,row["id"]))
+                self._audit("supervisor_task_disposed",row["id"],{"actor":actor,"reason":reason[:500],"root_task_id":task_id})
+                disposed.append(row["id"])
+            self.db.execute("COMMIT")
+            return disposed
+        except Exception:
+            if self.db.in_transaction: self.db.execute("ROLLBACK")
+            raise
+
+    def _supervisor_assignment_active(self, task_id: str, now: float) -> bool:
+        row=self.db.execute("SELECT t.supervisor_id,t.supervisor_generation,s.generation,s.lifecycle,s.revoked,s.heartbeat,s.created FROM tasks t LEFT JOIN supervisors s ON s.id=t.supervisor_id WHERE t.id=?",(task_id,)).fetchone()
+        return bool(row and (row["supervisor_id"] is None or (row["supervisor_generation"] == row["generation"] and row["revoked"] is None and row["lifecycle"]=="active"
+            and now-(row["heartbeat"] if row["heartbeat"] is not None else row["created"]) < self.supervisor_stale_seconds)))
+
+    def unregister_supervisor(self, supervisor_id: str, *, actor: str):
+        self.supervisor_lifecycle(supervisor_id,action="deboard",actor=actor)
+
+    def bind_supervisor_recipient(self, supervisor_id: str, recipient: str, *, actor: str):
+        """Bind an exact inbound address to one active registered supervisor."""
+        if not recipient or recipient != recipient.strip() or len(recipient) > 254 or "@" not in recipient:
+            raise ValueError("invalid supervisor recipient")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            supervisor = self.db.execute("SELECT * FROM supervisors WHERE id=?", (supervisor_id,)).fetchone()
+            if not supervisor or not self._supervisor_is_live(supervisor, self.clock()):
+                raise ValueError("recipient binding requires an active supervisor lease")
+            self.db.execute("INSERT INTO supervisor_recipients VALUES(?,?,1,?) ON CONFLICT(recipient) DO UPDATE SET supervisor_id=excluded.supervisor_id,enabled=1,created=excluded.created",
+                            (recipient, supervisor_id, self.clock()))
+            self._audit("supervisor_recipient_bound", supervisor_id, {"recipient": recipient, "actor": actor})
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK"); raise
+
+    def unbind_supervisor_recipient(self, recipient: str, *, actor: str):
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            changed = self.db.execute("UPDATE supervisor_recipients SET enabled=0 WHERE recipient=? AND enabled=1", (recipient,)).rowcount
+            if not changed: raise ValueError("unknown or disabled recipient")
+            self._audit("supervisor_recipient_unbound", recipient, {"actor": actor})
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK"); raise
 
     def route_supervisor_event(self, supervisor_id: str, event_id: str, *, issued: int, signature: str, token: str):
         """Authenticate a supervisor, then resolve only matching authoritative event data."""
@@ -329,18 +590,68 @@ class Engine:
             try:
                 sup=self.db.execute("SELECT * FROM supervisors WHERE id=? AND revoked IS NULL",(supervisor_id,)).fetchone()
                 if not sup or not isinstance(token,str) or not 32 <= len(token) <= 1024 or not hmac.compare_digest(sup["token_hash"],hashlib.sha256(token.encode()).hexdigest()): raise ValueError("unknown or revoked supervisor")
+                if not self._supervisor_is_live(sup, self.clock()): raise ValueError("supervisor lease expired or inactive")
                 if not isinstance(issued,int) or abs(self.clock()-issued)>300: raise ValueError("stale supervisor receipt")
-                row=self.db.execute("SELECT e.id,e.task_id,e.kind,e.payload,e.received,o.event_type,t.project_id FROM events e JOIN outbox o ON o.id='worker:'||e.id JOIN tasks t ON t.id=e.task_id WHERE e.id=?",(event_id,)).fetchone()
-                if not row or row["project_id"]!=sup["project_id"]: raise ValueError("event is not authoritative for this supervisor")
+                row=self.db.execute("SELECT e.id,e.task_id,e.kind,e.payload,e.received,o.event_type,t.project_id,t.supervisor_id,t.supervisor_generation FROM events e JOIN outbox o ON o.id='worker:'||e.id JOIN tasks t ON t.id=e.task_id WHERE e.id=?",(event_id,)).fetchone()
+                if not row or row["project_id"]!=sup["project_id"] or row["supervisor_id"] != supervisor_id or row["supervisor_generation"] != sup["generation"]: raise ValueError("event is not authoritative for this supervisor generation")
                 body=f"{supervisor_id}\n{event_id}\n{row['event_type']}\n{issued}".encode()
                 expected=hmac.new(token.encode(),body,hashlib.sha256).hexdigest()
                 if not isinstance(signature,str) or not hmac.compare_digest(expected,signature): raise ValueError("supervisor receipt authentication failed")
+                self.db.execute("UPDATE supervisors SET heartbeat=? WHERE id=? AND generation=?",(self.clock(),supervisor_id,sup["generation"]))
                 self.db.execute("INSERT INTO supervisor_routes VALUES(?,?,?)",(supervisor_id,event_id,self.clock()))
                 self._audit("supervisor_event_routed",supervisor_id,{"event_id":event_id,"event_type":row["event_type"]})
                 self.db.execute("COMMIT")
                 result=dict(row); result["payload"]=json.loads(result["payload"]); result.pop("project_id",None); return result
             except sqlite3.IntegrityError as exc:
                 self.db.execute("ROLLBACK"); raise ValueError("supervisor receipt replay rejected") from exc
+            except Exception:
+                if self.db.in_transaction: self.db.execute("ROLLBACK")
+                raise
+
+    def route_verified_supervisor_receipt(self, supervisor_id: str, event_id: str, *, recipient: str, receipt_token: str,
+                                          receipt_key: bytes, issued: int, signature: str, token: str):
+        """Atomically consume an authenticated SMTP receipt and route its event."""
+        import hashlib, hmac
+        from .smtp_delivery import verify_receipt
+        receipt = verify_receipt(receipt_token, receipt_key)
+        if receipt.get("event_id") != event_id or receipt.get("recipient") != recipient:
+            raise ValueError("receipt target or event mismatch")
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                sup = self.db.execute("SELECT * FROM supervisors WHERE id=? AND revoked IS NULL", (supervisor_id,)).fetchone()
+                if not sup or not isinstance(token, str) or not 32 <= len(token) <= 1024 or not hmac.compare_digest(sup["token_hash"], hashlib.sha256(token.encode()).hexdigest()):
+                    raise ValueError("unknown or revoked supervisor")
+                if not self._supervisor_is_live(sup, self.clock()):
+                    raise ValueError("supervisor lease expired or inactive")
+                binding = self.db.execute("SELECT 1 FROM supervisor_recipients WHERE recipient=? AND supervisor_id=? AND enabled=1", (recipient, supervisor_id)).fetchone()
+                if not binding:
+                    raise ValueError("recipient is not bound to this supervisor")
+                if not isinstance(issued, int) or abs(self.clock() - issued) > 300:
+                    raise ValueError("stale supervisor receipt")
+                row = self.db.execute("SELECT e.id,e.task_id,e.kind,e.payload,e.received,o.event_type,t.project_id,t.supervisor_id,t.supervisor_generation FROM events e JOIN outbox o ON o.id='worker:'||e.id JOIN tasks t ON t.id=e.task_id WHERE e.id=?", (event_id,)).fetchone()
+                if not row or row["project_id"] != sup["project_id"] or row["supervisor_id"] != supervisor_id or row["supervisor_generation"] != sup["generation"]:
+                    raise ValueError("event is not authoritative for this supervisor")
+                if receipt.get("event_type") != row["event_type"]:
+                    raise ValueError("receipt type mismatch")
+                body = f"{supervisor_id}\n{event_id}\n{row['event_type']}\n{issued}".encode()
+                expected = hmac.new(token.encode(), body, hashlib.sha256).hexdigest()
+                if not isinstance(signature, str) or not hmac.compare_digest(expected, signature):
+                    raise ValueError("supervisor receipt authentication failed")
+                # Both replay fences commit together, so a wrong-project wake
+                # cannot consume a valid mail receipt and races have one winner.
+                self.db.execute("INSERT INTO consumed_receipt_events(event_id,consumed) VALUES(?,?)", (event_id, self.clock()))
+                self.db.execute("INSERT INTO consumed_receipts(token_id,event_id,consumed) VALUES(?,?,?)", (receipt["token_id"], event_id, self.clock()))
+                self.db.execute("UPDATE supervisors SET heartbeat=? WHERE id=? AND generation=?", (self.clock(), supervisor_id, sup["generation"]))
+                self.db.execute("INSERT INTO supervisor_routes VALUES(?,?,?)", (supervisor_id, event_id, self.clock()))
+                self._audit("receipt_consumed", event_id, {"actor": "trusted-local-native-bridge", "event_type": row["event_type"]})
+                self._audit("supervisor_event_routed", supervisor_id, {"event_id": event_id, "event_type": row["event_type"]})
+                self.db.execute("COMMIT")
+                result = dict(row); result["payload"] = json.loads(result["payload"]); result.pop("project_id", None)
+                return result
+            except sqlite3.IntegrityError as exc:
+                self.db.execute("ROLLBACK")
+                raise ValueError("supervisor receipt replay rejected") from exc
             except Exception:
                 if self.db.in_transaction: self.db.execute("ROLLBACK")
                 raise
@@ -378,6 +689,7 @@ class Engine:
     def submit(self, project_id: str, intention: str, *, approval_required: bool = True,
                read_only: bool | None = None, max_attempts: int = 3,
                parent_task_id: str | None = None,
+               supervisor_id: str | None = None,
                workflow_budget: int | None = None, workflow_max_depth: int | None = None,
                workflow_timeout: int | None = None) -> str:
         if not intention.strip() or len(intention) > self.MAX_INTENTION_CHARS: raise ValueError("intention must contain 1–4000 characters")
@@ -387,11 +699,23 @@ class Engine:
         try:
             p = self.db.execute("SELECT policy FROM projects WHERE id=?", (project_id,)).fetchone()
             if p is None: raise ValueError(f"unknown project: {project_id}")
+            if supervisor_id is not None:
+                supervisor = self.db.execute("SELECT * FROM supervisors WHERE id=? AND project_id=?", (supervisor_id, project_id)).fetchone()
+                if (not supervisor or supervisor["revoked"] is not None or supervisor["lifecycle"] != "active"
+                        or self.clock()-(supervisor["heartbeat"] if supervisor["heartbeat"] is not None else supervisor["created"]) >= self.supervisor_stale_seconds):
+                    raise ValueError("new assignment requires an active supervisor for this project")
             depth, workflow_id = 0, None
             if parent_task_id:
-                parent = self.db.execute("SELECT project_id,status,workflow_id,depth FROM tasks WHERE id=?", (parent_task_id,)).fetchone()
+                parent = self.db.execute("SELECT project_id,status,workflow_id,depth,supervisor_id,supervisor_generation FROM tasks WHERE id=?", (parent_task_id,)).fetchone()
                 if not parent or parent["project_id"] != project_id or parent["status"] != "succeeded":
                     raise ValueError("dependent task requires a succeeded parent in the same project")
+                if supervisor_id is not None and supervisor_id != parent["supervisor_id"]:
+                    raise ValueError("dependent task must retain its parent's supervisor ownership")
+                if parent["supervisor_id"] is not None:
+                    owner=self.db.execute("SELECT * FROM supervisors WHERE id=?",(parent["supervisor_id"],)).fetchone()
+                    if (not owner or parent["supervisor_generation"] != owner["generation"] or owner["revoked"] is not None or owner["lifecycle"] != "active"
+                        or self.clock()-(owner["heartbeat"] if owner["heartbeat"] is not None else owner["created"]) >= self.supervisor_stale_seconds):
+                        raise ValueError("dependent assignment requires an active supervisor lease")
                 workflow_id, depth = parent["workflow_id"], parent["depth"] + 1
                 workflow = self.db.execute("SELECT * FROM workflows WHERE id=?", (workflow_id,)).fetchone()
                 count = self.db.execute("SELECT count(*) FROM tasks WHERE workflow_id=?", (workflow_id,)).fetchone()[0]
@@ -418,8 +742,14 @@ class Engine:
                 self.db.execute("INSERT INTO workflows(id,project_id,max_tasks,max_depth,deadline,state,termination_reason,created,updated) VALUES(?,?,?,?,?,?,?,?,?)",
                                 (workflow_id, project_id, budget, depth_limit, now + timeout, "active", None, now, now))
             status = "awaiting_approval" if approval_required else "ready"
-            self.db.execute("INSERT INTO tasks(id,project_id,intention,status,approval_required,read_only,max_attempts,available_at,created,updated,parent_task_id,workflow_id,depth) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (tid, project_id, intention, status, int(approval_required), int(task_ro), max_attempts, now, now, now, parent_task_id, workflow_id, depth))
+            if parent_task_id:
+                owner_id, owner_generation = parent["supervisor_id"], parent["supervisor_generation"]
+            elif supervisor_id is not None:
+                owner_id, owner_generation = supervisor_id, supervisor["generation"]
+            else:
+                owner_id, owner_generation = None, None
+            self.db.execute("INSERT INTO tasks(id,project_id,intention,status,approval_required,read_only,max_attempts,available_at,created,updated,parent_task_id,workflow_id,depth,supervisor_id,supervisor_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (tid, project_id, intention, status, int(approval_required), int(task_ro), max_attempts, now, now, now, parent_task_id, workflow_id, depth, owner_id, owner_generation))
             self._audit("task_submitted", tid, {"project_id": project_id, "approval_required": approval_required,
                         "read_only": task_ro, "parent_task_id": parent_task_id})
             if own_tx: self.db.execute("COMMIT")
@@ -446,8 +776,9 @@ class Engine:
         self._audit("workflow_terminated", workflow_id, {"reason": reason})
 
     def approve(self, task_id: str, *, actor: str = "local-operator"):
-        cur = self.db.execute("UPDATE tasks SET status='ready',approval_required=0,updated=? WHERE id=? AND status='awaiting_approval'",
-                              (self.clock(), task_id))
+        now=self.clock()
+        cur = self.db.execute("UPDATE tasks SET status='ready',approval_required=0,updated=? WHERE id=? AND status='awaiting_approval' AND (supervisor_id IS NULL OR EXISTS (SELECT 1 FROM supervisors s WHERE s.id=tasks.supervisor_id AND s.generation=tasks.supervisor_generation AND s.revoked IS NULL AND s.lifecycle='active' AND COALESCE(s.heartbeat,s.created)+?>?))",
+                              (now, task_id, self.supervisor_stale_seconds, now))
         if not cur.rowcount: raise ValueError("task is not awaiting approval")
         self._audit("task_approved", task_id, {"actor": actor})
 
@@ -484,7 +815,7 @@ class Engine:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             accepted = False
-            task = self.db.execute("SELECT status,attempts,max_attempts,lease_until,workflow_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            task = self.db.execute("SELECT status,attempts,max_attempts,lease_until,workflow_id,supervisor_id,supervisor_generation FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task: raise ValueError("unknown task")
             try:
                 self.db.execute("INSERT INTO events VALUES(?,?,?,?,?)", (event_id, task_id, kind, json.dumps(payload, sort_keys=True), now))
@@ -494,7 +825,12 @@ class Engine:
             # Adapter callbacks are fenced to the attempt that produced them. A
             # late result from an earlier retry must never finish the new lease.
             event_attempt = payload.get("attempt")
-            if (task["status"] == "running" and task["lease_until"] is not None and task["lease_until"] > now
+            owner_current = True
+            if task["supervisor_id"] is not None:
+                owner = self.db.execute("SELECT * FROM supervisors WHERE id=?", (task["supervisor_id"],)).fetchone()
+                owner_current = bool(owner and task["supervisor_generation"] == owner["generation"]
+                                     and self._supervisor_is_live(owner, now, allow_recovery=True))
+            if (task["status"] == "running" and task["lease_until"] is not None and task["lease_until"] > now and owner_current
                     and (event_attempt is None or event_attempt == task["attempts"])):
                 accepted = True
                 if kind == "completed":
@@ -523,7 +859,16 @@ class Engine:
                         self._terminate_workflow(task["workflow_id"], "depth_limit", now)
                     elif task_count + len(steps) > workflow["max_tasks"]:
                         self._terminate_workflow(task["workflow_id"], "task_budget_exhausted", now)
-                    for step in steps if self.db.execute("SELECT state FROM workflows WHERE id=?", (task["workflow_id"],)).fetchone()[0] == "active" else []:
+                    owner_id=self.db.execute("SELECT supervisor_id FROM tasks WHERE id=?",(task_id,)).fetchone()[0]
+                    owner_live=True
+                    if owner_id:
+                        owner=self.db.execute("SELECT * FROM supervisors WHERE id=?",(owner_id,)).fetchone()
+                        owner_live=bool(owner and self.db.execute("SELECT supervisor_generation FROM tasks WHERE id=?",(task_id,)).fetchone()[0] == owner["generation"] and owner["revoked"] is None and owner["lifecycle"]=="active"
+                            and self.clock()-(owner["heartbeat"] if owner["heartbeat"] is not None else owner["created"]) < self.supervisor_stale_seconds)
+                        if not owner_live and steps:
+                            self._audit("supervisor_descendants_held",owner_id,{"parent_task_id":task_id,"reason":"supervisor lease inactive"})
+                    active_workflow=self.db.execute("SELECT state FROM workflows WHERE id=?", (task["workflow_id"],)).fetchone()[0] == "active"
+                    for step in steps if active_workflow and owner_live else []:
                         if not isinstance(step, dict) or set(step) - {"intention", "approval_required", "read_only"} or not isinstance(step.get("intention"), str) or not step["intention"].strip() or len(step["intention"]) > 2000:
                             raise ValueError("each next step needs an intention and supported options")
                         preapproved = (self.allow_preapproved_read_only_steps and
@@ -604,6 +949,9 @@ class Engine:
 
     def _reconcile(self, *, owner: str | None = None) -> list[str]:
         owner = owner or f"local-{uuid.uuid4()}"
+        # Reaping runs on the existing local reconciliation cadence. It does
+        # not renew leases; only the authenticated supervisor path can do so.
+        self._reap_supervisors(actor="local-reconciliation-cadence")
         now = self.clock()
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -630,7 +978,7 @@ class Engine:
             active = self.db.execute("SELECT count(*) FROM tasks WHERE status='running'").fetchone()[0]
             remaining = (self.max_dispatches - self._dispatch_count) if self.max_dispatches is not None else self.max_concurrency
             slots = max(0, min(self.max_concurrency-active, remaining))
-            rows = self.db.execute("SELECT t.*,p.root,CASE WHEN a.expires>? THEN 1 ELSE 0 END AS write_authorized FROM tasks t JOIN projects p ON p.id=t.project_id JOIN workflows w ON w.id=t.workflow_id LEFT JOIN project_write_authorizations a ON a.project_id=p.id WHERE t.status='ready' AND t.available_at<=? AND w.state='active' AND w.deadline>? ORDER BY t.created LIMIT ?", (now, now, now, slots)).fetchall()
+            rows = self.db.execute("SELECT t.*,p.root,CASE WHEN a.expires>? THEN 1 ELSE 0 END AS write_authorized FROM tasks t JOIN projects p ON p.id=t.project_id JOIN workflows w ON w.id=t.workflow_id LEFT JOIN project_write_authorizations a ON a.project_id=p.id LEFT JOIN supervisors s ON s.id=t.supervisor_id WHERE t.status='ready' AND t.available_at<=? AND w.state='active' AND w.deadline>? AND (t.supervisor_id IS NULL OR (t.supervisor_generation=s.generation AND s.revoked IS NULL AND s.lifecycle='active' AND COALESCE(s.heartbeat,s.created)+?>?)) ORDER BY t.created LIMIT ?", (now, now, now, self.supervisor_stale_seconds, now, slots)).fetchall()
             for r in rows:
                 claimed_task = self.db.execute("UPDATE tasks SET status='running',attempts=attempts+1,lease_owner=?,lease_until=?,updated=? WHERE id=? AND status='ready' AND EXISTS (SELECT 1 FROM workflows w WHERE w.id=tasks.workflow_id AND w.state='active' AND w.deadline>?)",
                                 (owner, now+self.lease_seconds, now, r["id"], now)).rowcount
@@ -658,10 +1006,11 @@ class Engine:
                 task_state = self.db.execute("SELECT status,approval_required,read_only FROM tasks WHERE id=?", (r["id"],)).fetchone()
                 stopped = self.db.execute("SELECT value FROM control WHERE key='emergency_stop'").fetchone()[0] == "1"
                 auth = self.db.execute("SELECT expires FROM project_write_authorizations WHERE project_id=?", (r["project_id"],)).fetchone() if not r["read_only"] else True
+                supervisor_live=self._supervisor_assignment_active(r["id"],now)
                 permitted = (workflow and workflow["state"] == "active" and workflow["deadline"] > now
                              and workflow["dispatch_count"] < workflow["max_tasks"] and task_state
                              and task_state["status"] == "running" and not task_state["approval_required"]
-                             and not stopped and (r["read_only"] or (auth and auth["expires"] > now)))
+                             and not stopped and supervisor_live and (r["read_only"] or (auth and auth["expires"] > now)))
                 if not permitted:
                     self.db.execute("UPDATE dispatch_intents SET state='suppressed',claimed=NULL WHERE task_id=?", (r["id"],))
                     self.db.execute("UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL,last_error='dispatch suppressed by final safety fence',updated=? WHERE id=? AND status='running'", (now, r["id"]))
@@ -682,9 +1031,10 @@ class Engine:
                 now = self.clock()
                 stopped = self.db.execute("SELECT value FROM control WHERE key='emergency_stop'").fetchone()[0] == "1"
                 auth = self.db.execute("SELECT expires FROM project_write_authorizations WHERE project_id=?", (r["project_id"],)).fetchone() if not r["read_only"] else True
+                supervisor_live=self._supervisor_assignment_active(r["id"],now)
                 if (not workflow or workflow["state"] != "active" or workflow["deadline"] <= now
                         or not task_state or task_state["status"] != "running" or task_state["approval_required"]
-                        or stopped or (not r["read_only"] and not (auth and auth["expires"] > now))):
+                        or stopped or not supervisor_live or (not r["read_only"] and not (auth and auth["expires"] > now))):
                     if workflow and workflow["state"] == "active" and task_state and task_state["status"] == "running":
                         self.db.execute("UPDATE dispatch_intents SET state='suppressed',claimed=NULL WHERE task_id=? AND state='dispatching'", (r["id"],))
                         self.db.execute("UPDATE tasks SET status='cancelled',lease_owner=NULL,lease_until=NULL,last_error='launch fence rejected dispatch',updated=? WHERE id=? AND status='running'", (now, r["id"]))

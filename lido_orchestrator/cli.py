@@ -7,8 +7,11 @@ from .codex_worker import CodexWorker
 from .smtp_delivery import SMTPOutboxAdapter, load_config, load_receipt_key, verify_receipt
 
 def main(argv=None):
-    p=argparse.ArgumentParser(prog="lido",description="Local durable Codex supervisor (dry-run by default)")
+    p=argparse.ArgumentParser(prog="lido",description="Local durable Codex supervisor (dry-run by default)",allow_abbrev=False)
     p.add_argument("--db",default=os.environ.get("LIDO_DB","lido.sqlite3"))
+    p.add_argument("--supervisor-stale-seconds",type=int,default=10800,help="supervisor lease stale threshold (default 10800)")
+    p.add_argument("--supervisor-inactive-seconds",type=int,default=21600,help="supervisor lease inactive threshold (default 21600)")
+    p.add_argument("--supervisor-orphan-seconds",type=int,default=86400,help="supervisor lease orphan threshold (default 86400)")
     p.add_argument("--codex",action="store_true",help="enable the real Codex adapter (also requires LIDO_ENABLE_CODEX=1)")
     p.add_argument("--allow-preapproved-read-only-steps",action="store_true",
                    help="release explicitly preapproved read-only dependent steps immediately")
@@ -19,13 +22,19 @@ def main(argv=None):
     ss.add_parser("list")
     a=ss.add_parser("status"); a.add_argument("supervisor_id")
     a=ss.add_parser("unregister"); a.add_argument("supervisor_id"); a.add_argument("--actor",required=True)
+    a=ss.add_parser("heartbeat"); a.add_argument("supervisor_id"); a.add_argument("--generation",type=int)
+    a=ss.add_parser("lifecycle"); a.add_argument("supervisor_id"); a.add_argument("action",choices=["suspend","resume","complete","deboard","takeover"]); a.add_argument("--actor",required=True)
+    a=ss.add_parser("adopt"); a.add_argument("task_id"); a.add_argument("supervisor_id"); a.add_argument("--actor",required=True,help="trusted local operator making an audited recovery decision")
+    a=ss.add_parser("dispose"); a.add_argument("task_id"); a.add_argument("--actor",required=True); a.add_argument("--reason",required=True)
+    a=ss.add_parser("reap"); a.add_argument("--actor",required=True,help="trusted local management identity")
     a=ss.add_parser("route"); a.add_argument("supervisor_id"); a.add_argument("event_id"); a.add_argument("--issued",type=int,required=True); a.add_argument("--signature",required=True,help="hex HMAC over supervisor id, event id, authoritative type and issued time")
+    a=ss.add_parser("bind-recipient"); a.add_argument("supervisor_id"); a.add_argument("recipient"); a.add_argument("--actor",required=True)
+    a=ss.add_parser("unbind-recipient"); a.add_argument("recipient"); a.add_argument("--actor",required=True)
     a=sub.add_parser("register-project"); a.add_argument("project_id"); a.add_argument("root"); a.add_argument("--writable",action="store_true")
-    a=sub.add_parser("submit"); a.add_argument("project_id"); a.add_argument("intention"); a.add_argument("--no-approval",action="store_true"); a.add_argument("--read-only",action="store_true",default=None); a.add_argument("--max-attempts",type=int,default=3)
+    a=sub.add_parser("submit"); a.add_argument("project_id"); a.add_argument("intention"); a.add_argument("--no-approval",action="store_true"); a.add_argument("--read-only",action="store_true",default=None); a.add_argument("--max-attempts",type=int,default=3); a.add_argument("--supervisor",help="scope this new assignment to an active registered supervisor")
     a.add_argument("--workflow-budget",type=int,default=None,help="durable total task/dispatch budget for this workflow")
     a.add_argument("--workflow-max-depth",type=int,default=None); a.add_argument("--workflow-timeout",type=int,default=None,help="workflow lifetime in seconds")
     a=sub.add_parser("approve"); a.add_argument("task_id"); a.add_argument("--actor",default="local-operator")
-    a=sub.add_parser("event"); a.add_argument("event_id"); a.add_argument("task_id"); a.add_argument("kind",choices=["completed","failed"]); a.add_argument("--payload",default="{}")
     a=sub.add_parser("status")
     a=sub.add_parser("project-snapshot"); a.add_argument("project_id"); a.add_argument("--max-entries",type=int,default=200)
     sub.add_parser("outbox")
@@ -39,30 +48,47 @@ def main(argv=None):
     a=sub.add_parser("stop"); a.add_argument("state",choices=["on","off"])
     a=sub.add_parser("terminate-workflow"); a.add_argument("workflow_id"); a.add_argument("--actor",default="local-operator"); a.add_argument("--reason",required=True)
     args=p.parse_args(argv)
+    if not 1 <= args.supervisor_stale_seconds <= args.supervisor_inactive_seconds <= args.supervisor_orphan_seconds <= 31536000:
+        p.error("supervisor lease thresholds must be positive, ordered, and at most one year")
     if args.codex and os.environ.get("LIDO_ENABLE_CODEX") != "1":
         p.error("--codex also requires LIDO_ENABLE_CODEX=1")
     worker=CodexWorker(enabled=True,event_sink=lambda eid,tid,kind,payload: engine.ingest_event(eid,tid,kind,payload)) if args.codex else None
     engine=Engine(args.db,dry_run=not args.codex,worker=worker,
-                  allow_preapproved_read_only_steps=args.allow_preapproved_read_only_steps)
+                  allow_preapproved_read_only_steps=args.allow_preapproved_read_only_steps,
+                  supervisor_stale_seconds=args.supervisor_stale_seconds,
+                  supervisor_inactive_seconds=args.supervisor_inactive_seconds,
+                  supervisor_orphan_seconds=args.supervisor_orphan_seconds)
     try:
         if args.cmd=="register-project": engine.register_project(args.project_id,args.root,read_only=not args.writable); out={"registered":args.project_id}
-        elif args.cmd=="info": out={"commands":["supervisor register|list|status|unregister|route","register-project","submit","approve","status","reconcile","serve","smtp-deliver","verify-receipt"],"defaults":{"dispatch":"disabled unless explicitly opted in","approval":"required","network_listener":False}}
+        elif args.cmd=="info": out={"commands":["supervisor register|list|status|heartbeat|lifecycle|adopt|dispose|reap|unregister|route|bind-recipient|unbind-recipient","register-project","submit","approve","status","reconcile","serve","smtp-deliver","verify-receipt"],"defaults":{"dispatch":"disabled unless explicitly opted in","approval":"required","network_listener":False,"supervisor_lease_stale_seconds":args.supervisor_stale_seconds,"supervisor_inactive_seconds":args.supervisor_inactive_seconds,"supervisor_orphan_seconds":args.supervisor_orphan_seconds}}
         elif args.cmd=="supervisor":
             if args.supervisor_cmd=="register":
                 token=secrets.token_urlsafe(32)
                 engine.register_supervisor(args.supervisor_id,args.project_id,args.worker_id,token_hash=hashlib.sha256(token.encode()).hexdigest())
-                out={"registered":args.supervisor_id,"project_id":args.project_id,"worker_id":args.worker_id,"trusted_local":True,"route_token_once":token}
+                out={"registered":args.supervisor_id,"project_id":args.project_id,"worker_id":args.worker_id,"generation":1,"trusted_local":True,"route_token_once":token}
             elif args.supervisor_cmd=="list": out={"supervisors":engine.list_supervisors()}
             elif args.supervisor_cmd=="status": out=engine.supervisor_status(args.supervisor_id)
             elif args.supervisor_cmd=="unregister": engine.unregister_supervisor(args.supervisor_id,actor=args.actor); out={"revoked":args.supervisor_id}
+            elif args.supervisor_cmd=="heartbeat":
+                token=sys.stdin.readline(1026).strip(); out=engine.supervisor_heartbeat(args.supervisor_id,token=token,generation=args.generation)
+            elif args.supervisor_cmd=="reap": out={"changed":engine.reap_supervisors(actor=args.actor)}
+            elif args.supervisor_cmd=="lifecycle":
+                new_token=secrets.token_urlsafe(32) if args.action=="takeover" else None
+                result=engine.supervisor_lifecycle(args.supervisor_id,action=args.action,actor=args.actor,
+                    token_hash=hashlib.sha256(new_token.encode()).hexdigest() if new_token else None)
+                out={"supervisor":result}
+                if new_token: out["route_token_once"]=new_token
+            elif args.supervisor_cmd=="adopt": out={"task":engine.adopt_supervisor_task(args.task_id,args.supervisor_id,actor=args.actor)}
+            elif args.supervisor_cmd=="dispose": out={"cancelled":engine.dispose_supervisor_task(args.task_id,actor=args.actor,reason=args.reason)}
+            elif args.supervisor_cmd=="bind-recipient": engine.bind_supervisor_recipient(args.supervisor_id,args.recipient,actor=args.actor); out={"bound":args.recipient,"supervisor_id":args.supervisor_id}
+            elif args.supervisor_cmd=="unbind-recipient": engine.unbind_supervisor_recipient(args.recipient,actor=args.actor); out={"unbound":args.recipient}
             else:
                 token=sys.stdin.readline(1026).strip()
                 if len(token)>1024: p.error("supervisor route rejected")
                 out=engine.route_supervisor_event(args.supervisor_id,args.event_id,issued=args.issued,signature=args.signature,token=token)
         elif args.cmd=="submit": out={"task_id":engine.submit(args.project_id,args.intention,approval_required=not args.no_approval,read_only=args.read_only,max_attempts=args.max_attempts,
-            workflow_budget=args.workflow_budget,workflow_max_depth=args.workflow_max_depth,workflow_timeout=args.workflow_timeout)}
+            supervisor_id=args.supervisor,workflow_budget=args.workflow_budget,workflow_max_depth=args.workflow_max_depth,workflow_timeout=args.workflow_timeout)}
         elif args.cmd=="approve": engine.approve(args.task_id,actor=args.actor); out={"approved":args.task_id}
-        elif args.cmd=="event": out={"accepted":engine.ingest_event(args.event_id,args.task_id,args.kind,json.loads(args.payload))}
         elif args.cmd=="status": out=engine.snapshot()
         elif args.cmd=="project-snapshot": out=engine.project_snapshot(args.project_id,max_entries=args.max_entries)
         elif args.cmd=="outbox": out={"pending":engine.pending_outbox()}
