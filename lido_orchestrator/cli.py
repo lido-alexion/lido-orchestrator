@@ -5,6 +5,7 @@ from dataclasses import replace
 from .engine import Engine
 from .codex_worker import CodexWorker
 from .smtp_delivery import SMTPOutboxAdapter, load_config, load_receipt_key, verify_receipt
+from . import resource_cleanup
 
 def main(argv=None):
     p=argparse.ArgumentParser(prog="lido",description="Local durable Codex supervisor (dry-run by default)",allow_abbrev=False)
@@ -15,6 +16,8 @@ def main(argv=None):
     p.add_argument("--codex",action="store_true",help="enable the real Codex adapter (also requires LIDO_ENABLE_CODEX=1)")
     p.add_argument("--allow-preapproved-read-only-steps",action="store_true",
                    help="release explicitly preapproved read-only dependent steps immediately")
+    p.add_argument("--automatic-worker-cleanup",action="store_true",
+                   help="opt in to process-free cleanup after exact inactivity and preservation authorization")
     sub=p.add_subparsers(dest="cmd",required=True)
     sub.add_parser("info",help="show command and safety summary")
     sup=sub.add_parser("supervisor"); ss=sup.add_subparsers(dest="supervisor_cmd",required=True)
@@ -47,20 +50,29 @@ def main(argv=None):
     a=sub.add_parser("serve"); a.add_argument("--interval",type=int,default=300); a.add_argument("--once",action="store_true"); a.add_argument("--max-tasks",type=int,default=20)
     a=sub.add_parser("stop"); a.add_argument("state",choices=["on","off"])
     a=sub.add_parser("terminate-workflow"); a.add_argument("workflow_id"); a.add_argument("--actor",default="local-operator"); a.add_argument("--reason",required=True)
+    a=sub.add_parser("worker-resource-verify",help="record trusted-local exact-attempt inactivity evidence"); a.add_argument("task_id"); a.add_argument("attempt",type=int); a.add_argument("generation",type=int); a.add_argument("--evidence",required=True)
+    a=sub.add_parser("worker-resource-authorize",help="separately authorize disposal after preservation review"); a.add_argument("task_id"); a.add_argument("attempt",type=int); a.add_argument("generation",type=int); a.add_argument("--evidence",required=True)
+    a=sub.add_parser("worker-resource-cleanup",help="inspect or clean resources explicitly owned by a task"); a.add_argument("task_id"); a.add_argument("--execute",action="store_true",help="perform cleanup; default is dry-run"); a.add_argument("--retry",action="store_true"); a.add_argument("--retention-days",type=int); a.add_argument("--max-bytes",type=int)
+    a=sub.add_parser("worker-resource-policy",help="persist cleanup retention and byte limits"); a.add_argument("--retention-days",type=int,required=True); a.add_argument("--max-bytes",type=int,required=True)
     args=p.parse_args(argv)
     if not 1 <= args.supervisor_stale_seconds <= args.supervisor_inactive_seconds <= args.supervisor_orphan_seconds <= 31536000:
         p.error("supervisor lease thresholds must be positive, ordered, and at most one year")
     if args.codex and os.environ.get("LIDO_ENABLE_CODEX") != "1":
         p.error("--codex also requires LIDO_ENABLE_CODEX=1")
-    worker=CodexWorker(enabled=True,event_sink=lambda eid,tid,kind,payload: engine.ingest_event(eid,tid,kind,payload)) if args.codex else None
+    worker=CodexWorker(enabled=True,
+        event_sink=lambda eid,tid,kind,payload: engine.ingest_event(eid,tid,kind,payload),
+        resource_register=lambda tid,kind,path,root: engine.own_worker_resource(tid,kind,path,root),
+        process_started=lambda tid,attempt,generation,pid,pgid: engine.record_worker_process(tid,attempt,generation,pid,pgid),
+        process_exited=lambda tid,attempt,generation,pid,code: engine.record_worker_process_exit(tid,attempt,generation,pid,code)) if args.codex else None
     engine=Engine(args.db,dry_run=not args.codex,worker=worker,
                   allow_preapproved_read_only_steps=args.allow_preapproved_read_only_steps,
                   supervisor_stale_seconds=args.supervisor_stale_seconds,
                   supervisor_inactive_seconds=args.supervisor_inactive_seconds,
-                  supervisor_orphan_seconds=args.supervisor_orphan_seconds)
+                  supervisor_orphan_seconds=args.supervisor_orphan_seconds,
+                  automatic_worker_cleanup=args.automatic_worker_cleanup)
     try:
         if args.cmd=="register-project": engine.register_project(args.project_id,args.root,read_only=not args.writable); out={"registered":args.project_id}
-        elif args.cmd=="info": out={"commands":["supervisor register|list|status|heartbeat|lifecycle|adopt|dispose|reap|unregister|route|bind-recipient|unbind-recipient","register-project","submit","approve","status","reconcile","serve","smtp-deliver","verify-receipt"],"defaults":{"dispatch":"disabled unless explicitly opted in","approval":"required","network_listener":False,"supervisor_lease_stale_seconds":args.supervisor_stale_seconds,"supervisor_inactive_seconds":args.supervisor_inactive_seconds,"supervisor_orphan_seconds":args.supervisor_orphan_seconds}}
+        elif args.cmd=="info": out={"commands":["supervisor register|list|status|heartbeat|lifecycle|adopt|dispose|reap|unregister|route|bind-recipient|unbind-recipient","register-project","submit","approve","status","reconcile","serve","smtp-deliver","verify-receipt","worker-resource-verify","worker-resource-authorize","worker-resource-cleanup","worker-resource-policy"],"defaults":{"dispatch":"disabled unless explicitly opted in","approval":"required","network_listener":False,"worker_resource_cleanup":"dry-run; --execute required for explicit deletion","automatic_worker_cleanup":"disabled unless --automatic-worker-cleanup is set; process_free attempts only","supervisor_lease_stale_seconds":args.supervisor_stale_seconds,"supervisor_inactive_seconds":args.supervisor_inactive_seconds,"supervisor_orphan_seconds":args.supervisor_orphan_seconds}}
         elif args.cmd=="supervisor":
             if args.supervisor_cmd=="register":
                 token=secrets.token_urlsafe(32)
@@ -120,6 +132,15 @@ def main(argv=None):
             out={"claimed":claimed}
         elif args.cmd=="stop": engine.stop(args.state=="on"); out={"emergency_stop":args.state=="on"}
         elif args.cmd=="terminate-workflow": engine.terminate_workflow(args.workflow_id,actor=args.actor,reason=args.reason); out={"terminated":args.workflow_id}
+        elif args.cmd=="worker-resource-verify": out={"verified":engine.verify_worker_inactive(args.task_id,args.attempt,args.evidence,args.generation)}
+        elif args.cmd=="worker-resource-authorize": out={"authorized":engine.authorize_worker_cleanup(args.task_id,args.attempt,args.evidence,args.generation)}
+        elif args.cmd=="worker-resource-cleanup":
+            if (args.retention_days is not None and args.retention_days < 0) or (args.max_bytes is not None and args.max_bytes < 1): p.error("retention and byte limits must be non-negative/positive")
+            out=resource_cleanup.cleanup_task(engine,args.task_id,execute=args.execute,retry=args.retry,
+                retention_seconds=args.retention_days*86400 if args.retention_days is not None else None,max_bytes=args.max_bytes)
+        elif args.cmd=="worker-resource-policy":
+            if args.retention_days < 0 or args.max_bytes < 1: p.error("retention and byte limits must be non-negative/positive")
+            out=resource_cleanup.set_policy(engine,retention_seconds=args.retention_days*86400,max_bytes=args.max_bytes)
         else:
             if args.interval<1: p.error("interval must be positive")
             if args.once:
