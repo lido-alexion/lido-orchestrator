@@ -1,0 +1,13 @@
+[Unit]
+Description=Lido Orchestrator local dry-run reconciliation
+After=default.target
+
+[Service]
+Type=simple
+UMask=0077
+ExecStart=%h/.local/share/lido-orchestrator/releases/venv-FULL_GIT_REVISION/bin/lido --db %h/.local/state/lido-orchestrator/state.sqlite3 serve --interval 300
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=default.target

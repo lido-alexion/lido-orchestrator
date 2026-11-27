@@ -4,7 +4,7 @@ See [ACCEPTANCE.md](ACCEPTANCE.md) for the supported release boundary and separa
 
 Before every supervisor execution, follow the mandatory [SUPERVISOR_PROTOCOL.md](SUPERVISOR_PROTOCOL.md). The twelve [QUICK_GUIDE.md](QUICK_GUIDE.md) prompts are examples only; check [ONBOARDING.md](ONBOARDING.md) and installed `lido supervisor --help` for supported operations.
 
-Install the local package and CLI with `python3.12 -m pip install .`; the installed command is `lido`. Runtime state stays in the SQLite path selected by `--db` or `LIDO_DB`.
+The package version in `pyproject.toml` is the candidate version. Install each reviewed source snapshot into a dedicated virtual environment and keep that environment with its source/backup record; the installed command is `lido`. Runtime state stays in the SQLite path selected by `--db` or `LIDO_DB`.
 
 A small local supervisor for event-driven project automation. Python 3.12, standard library only. The CLI and service use SQLite and are **dry-run by default**. The built-in Codex adapter is read-only and uses a new empty scratch project. A separate workspace-write adapter contract is present for disposable non-production repositories, but there is no verified OS isolation backend and the adapter is not wired into the CLI or service. Writable execution is therefore disabled.
 
@@ -20,7 +20,7 @@ python3.12 -m lido_orchestrator --db ./lido.sqlite3 project-snapshot demo
 python3.12 -m lido_orchestrator --db ./lido.sqlite3 outbox
 ```
 
-Submissions require explicit approval by default. Each root task starts a durable workflow with a default maximum of 8 total tasks, depth 3, and a one-hour deadline. An embedding caller can set smaller or larger bounded values with `Engine.submit(..., workflow_budget=..., workflow_max_depth=..., workflow_timeout=...)`. Task count and dispatch attempts are stored in SQLite and survive restart; `reconcile --max-tasks N` is an additional per-invocation ceiling, not the workflow safety limit. A proposal that exceeds the task or depth budget terminates the workflow and cancels queued descendants. `stop`, `needs_review`, worker failure, lease ambiguity, and deadline expiry also terminate the workflow. Termination fences late events, asks a process-aware adapter to cancel running siblings, and moves any uncancellable/ambiguous dispatch to `needs_review`. Operators can cancel one workflow with `terminate-workflow WORKFLOW_ID --reason 'operator review'`. `serve` repeats reconciliation every five minutes (configurable). A one-shot waits for local adapter callbacks. Default dry-run tasks finish in the explicit `dry_run` state and never invoke an adapter. Use `stop on` to block new claims and `stop off` to resume. `event EVENT_ID TASK_ID completed|failed` is a local CLI operation; there is no network listener. Backups should use SQLite's online backup API or include the database and its WAL state.
+Submissions require explicit approval by default. Each root task starts a durable workflow with a default maximum of 8 total tasks, depth 3, and a one-hour deadline. An embedding caller can set smaller or larger bounded values with `Engine.submit(..., workflow_budget=..., workflow_max_depth=..., workflow_timeout=...)`. Task count and dispatch attempts are stored in SQLite and survive restart; `reconcile --max-tasks N` is an additional per-invocation ceiling, not the workflow safety limit. A proposal that exceeds the task or depth budget terminates the workflow and cancels queued descendants. `stop`, `needs_review`, worker failure, lease ambiguity, and deadline expiry also terminate the workflow. Termination fences late events, asks a process-aware adapter to cancel running siblings, and moves any uncancellable/ambiguous dispatch to `needs_review`. Operators can cancel one workflow with `terminate-workflow WORKFLOW_ID --reason 'operator review'`. `serve` repeats local reconciliation every five minutes by default (configurable); this local loop is independent of any external supervisor wake schedule. A one-shot waits for local adapter callbacks. Default dry-run tasks finish in the explicit `dry_run` state and never invoke an adapter. Use `stop on` to block new claims and `stop off` to resume. There is no CLI event injection command or network listener. Backups should use SQLite's online backup API or include the database and its WAL state.
 
 ## Integration contract
 
@@ -135,7 +135,7 @@ The intended synthetic workflow is a planning task, one approved read-only child
 
 SQLite is authoritative for projects, tasks, approvals, dispatch intents, leases, dedupe records, stop state, and append-only audit entries. SQLite `BEGIN IMMEDIATE` serializes task and intent claims across processes. Project registration is immutable: a project id cannot silently change its root or read-only policy. Running leases count against the configured global concurrency cap. Retries use capped exponential backoff. Approval and emergency-stop transitions are audited.
 
-For a ChatGPT hourly supervisor, use one shared local database and invoke read-only `status` for observation. Submit proposed intentions as `awaiting_approval`; an explicit local approval action is required before claim. Do not let the hourly process dispatch work or edit task/lease rows directly. Reconciliation claims under a SQLite write lock, so two supervisors can safely race to reconcile, while approval is a state transition against the same database. If unattended approved intentions are needed, use a separately authenticated narrow submit API that records the approving principal and intent; do not infer approval from a ChatGPT summary or status read.
+An external supervisor that runs hourly or is invoked manually is distinct from `serve`'s five-minute local reconciliation loop. This package does not schedule or wake that external supervisor. An external wake should inspect through the documented CLI and follow [SUPERVISOR_PROTOCOL.md](SUPERVISOR_PROTOCOL.md); it does not confer approval or execution authority. Native event listeners, provider automations, same-chat wake, and process containment are not implemented. Provider integration remains gated on authenticated identity, exact ownership/generation, replay protection, target-account testing, and independent review. Reconciliation claims under a SQLite write lock, so two local invocations can safely race, while approval is a state transition against the same database.
 
 ## Security boundaries and current limitations
 
@@ -143,17 +143,79 @@ Project roots are metadata, not sandbox enforcement. The Codex adapter enforces 
 
 ## Dry-run service deployment
 
-The example service is intentionally dry-run and is not installed or activated by this project. Review [the user service unit](examples/lido-orchestrator.user.service), install the package in the account that will own the database, create its state directory, then copy the unit into `~/.config/systemd/user/`. For UID 1000, make the user manager environment explicit when needed:
+The example service is an opt-in local dry-run loop; this project does not install, enable, start, or activate it. It has no `--codex` flag. Its illustrative path is not an installation instruction. Use a revision-specific immutable environment path and create any user unit only when the destination does not exist.
 
-```sh
-export XDG_RUNTIME_DIR=/run/user/1000
-export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
-systemctl --user daemon-reload
-systemctl --user start lido-orchestrator.service
-systemctl --user status lido-orchestrator.service
+### Versioned install, preflight, backup, and rollback
+
+Use a reviewed full Git revision as the installation identity. A package version alone is not unique across candidate revisions. Create a fresh, revision-named source directory and virtual environment for every revision; fail if either destination already exists. Never edit a staged source tree or reuse its environment. These Bash commands are examples for a reviewed Git checkout and do not activate a service. Use a trusted local home and a single operator with exclusive access to the release paths. For offline installation, first supply an approved local wheelhouse containing the package build requirements (including setuptools 68 or newer and any required wheel build component).
+
+```bash
+set -euo pipefail
+umask 077
+python3.12 --version
+: "${LIDO_WHEELHOUSE:?set the path to an approved local wheelhouse}"
+test -d "$LIDO_WHEELHOUSE"
+revision=$(git rev-parse HEAD)
+[[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+version=$(python3.12 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+stage_root="$HOME/.local/share/lido-orchestrator/releases"
+source_dir="$stage_root/source-$revision"
+venv_dir="$stage_root/venv-$revision"
+# BEGIN release path preflight
+if [[ -L "$stage_root" ]]; then
+  printf '%s\n' "release root must not be a symlink: $stage_root" >&2
+  exit 1
+elif [[ ! -d "$stage_root" || "$(stat -c '%a' "$stage_root")" != 700 || "$(stat -c '%u' "$stage_root")" != "$(id -u)" ]]; then
+  printf '%s\n' "release root must be a pre-provisioned current-user-owned mode-0700 directory" >&2
+  exit 1
+fi
+for path in "$source_dir" "$venv_dir"; do
+  if [[ -e "$path" || -L "$path" ]]; then
+    printf '%s\n' "refusing existing release path: $path" >&2
+    exit 1
+  fi
+done
+# END release path preflight
+mkdir "$source_dir"
+git archive "$revision" | tar -x -C "$source_dir"
+test "$(python3.12 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$source_dir/pyproject.toml")" = "$version"
+python3.12 -m venv "$venv_dir"
+"$venv_dir/bin/python" -m pip install --no-index --no-deps --find-links "$LIDO_WHEELHOUSE" "$source_dir"
+"$venv_dir/bin/lido" --help
+"$venv_dir/bin/lido" supervisor --help
+smoke_dir=$(mktemp -d)
+"$venv_dir/bin/lido" --db "$smoke_dir/fixture.sqlite3" info
+printf 'Disposable smoke fixture (retain for review): %s\n' "$smoke_dir"
 ```
 
-These values apply only when the service is managed by UID 1000's user systemd manager and that runtime bus exists. The service has no `--codex` flag and remains dry-run. Review logs and `status` before any separately approved change to the unit.
+Keep old source trees and environments unchanged. The explicit `if` guards run safely with Bash `errexit` and treat dangling symlinks as existing paths. The release root must already be a current-user-owned mode-0700 directory, provisioned separately by the operator at a trusted path; if staging is interrupted, inspect and quarantine that partial directory rather than reusing it. `--no-index --no-deps` disables index access and runtime dependency installation; build isolation resolves its requirements from the approved local wheelhouse. No source URLs or remote wheelhouse locations should be supplied. A failed offline install is a gate, not a reason to install globally or reuse another revision's environment.
+
+```sh
+umask 077
+db="$HOME/.local/state/lido-orchestrator/state.sqlite3"
+backup_root="$HOME/.local/state/lido-orchestrator/backups"
+# With all application users stopped, use a SQLite-aware backup procedure
+# (for example, the SQLite CLI .backup command) to create a new private backup.
+# Record and inspect the exact output path before relying on it.
+```
+
+Before an upgrade, confirm the exact database path and record its package version/revision. CLI state commands may initialize or migrate the selected database; use a disposable reviewed copy for preflight and do not use an implicit database path. Keep database and backups in private user-owned directories. Do not copy only the main database file while SQLite is active. Prefer SQLite's online backup API for a consistent backup, and verify the result with `PRAGMA quick_check` using a SQLite-aware tool. Retain the live database's WAL/SHM files with it. The candidate provides no backup or validation helper; operators are responsible for using reviewed SQLite procedures and confirming their results.
+
+Run the synthetic suite and package smoke checks from [RELEASE_HANDOFF.md](RELEASE_HANDOFF.md), inspect staged CLI `--help`/`info`, confirm no Codex opt-in, validate the backup, and review the example unit. Installation alone does not select a release or activate a service. If an operator separately opts in to a user unit, verify the destination is absent and never replace an existing unit implicitly. Adapt `ExecStart` to the exact revision environment. A user manager's runtime directory is UID-specific; derive it with `uid=$(id -u)` and use `/run/user/$uid` only when that session bus exists.
+
+Rollback is a manual recovery operation; this candidate intentionally provides no automated restore because filesystem sidecar and concurrent-user races cannot be closed safely by a generic helper. Stop and independently verify that every process using the database has exited. Preserve the complete database directory, including any `-wal`, `-shm`, `-journal`, and `-mj*` files; do not unlink sidecars manually or open the old database with an unreviewed binary. Use a SQLite-aware operator procedure to preserve the stopped current database and restore the validated backup into a separate new file, then run `PRAGMA quick_check` on that new file before any application opens it. Require that the destination and all corresponding sidecar paths are absent, and retain the original directory untouched until the restored state has been reviewed. If exclusivity, sidecar state, file identity, or recovery outcome is uncertain, stop and obtain SQLite-specific recovery assistance. Use the prior revision CLI help without opening state; do not let an older binary run `status`, `info`, or any other state-opening command against a newer schema until compatibility is established on a disposable copy. Selecting or restarting a unit remains a separate operator action.
+
+The following shows dynamic UID lookup only; this candidate never installs or activates a unit. If an operator later chooses to install one, create it with an exclusive file create after checking its content, rather than a command that overwrites an existing unit:
+
+```sh
+uid=$(id -u)
+mkdir -p "$HOME/.local/state/lido-orchestrator"
+export XDG_RUNTIME_DIR="/run/user/$uid"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+# Before any optional systemctl command, confirm this is the intended user manager.
+```
+
+These values apply only when the service is managed by the current user's user systemd manager and that runtime bus exists. No service command is run during candidate review. When an operator later opts in, the service remains dry-run; inspect its logs and `status` before changing the unit. A native provider event or external supervisor wake is not supplied by this unit.
 
 ## Checks
 

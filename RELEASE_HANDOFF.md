@@ -22,6 +22,10 @@ git diff --check
 
 Synthetic tests use temporary fixtures only. Package installation must pass in the normal disposable CI job before release acceptance.
 
+## Deployment guidance and periodic acceptance
+
+The README documents revision-pinned isolated installation with explicit preflight guards, a reviewed offline build wheelhouse, and operator-assisted SQLite backup and recovery. It does not automate restore or service replacement. The example user unit remains dry-run; its revision placeholder must be resolved by the operator. Synthetic tests exercise an actual periodic CLI loop on disposable state and document guard behavior. Package installation, deployment and persistent-service behavior still require their own acceptance evidence.
+
 ## Remaining acceptance
 
 - Independent review of source, adversarial tests, generic documentation, and frozen inventory.
