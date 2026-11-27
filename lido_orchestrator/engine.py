@@ -8,6 +8,7 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Any, Protocol
+from . import resource_cleanup
 
 
 class WorkerAdapter(Protocol):
@@ -21,6 +22,7 @@ class WorkerAdapter(Protocol):
 
 class DryRunWorker:
     """Safe default adapter: no external action is performed."""
+    process_free = True
     def dispatch(self, task: dict[str, Any]) -> None:
         return None
 
@@ -38,7 +40,8 @@ class Engine:
                  fault_hook=None, allow_preapproved_read_only_steps: bool = False,
                  workflow_budget: int = 8, workflow_max_depth: int = 3,
                  workflow_timeout: int = 3600, supervisor_stale_seconds: int = 10800,
-                 supervisor_inactive_seconds: int = 21600, supervisor_orphan_seconds: int = 86400):
+                 supervisor_inactive_seconds: int = 21600, supervisor_orphan_seconds: int = 86400,
+                 automatic_worker_cleanup: bool = False):
         if not 1 <= max_concurrency <= 64 or not 1 <= lease_seconds <= 3600:
             raise ValueError("concurrency must be 1–64 and lease duration 1–3600 seconds")
         if not 1 <= workflow_budget <= self.MAX_WORKFLOW_TASKS or not 0 <= workflow_max_depth <= self.MAX_WORKFLOW_DEPTH or not 1 <= workflow_timeout <= self.MAX_WORKFLOW_SECONDS:
@@ -49,6 +52,7 @@ class Engine:
         self.allow_preapproved_read_only_steps = allow_preapproved_read_only_steps
         self.workflow_budget, self.workflow_max_depth = workflow_budget, workflow_max_depth
         self.workflow_timeout = workflow_timeout
+        self.automatic_worker_cleanup = bool(automatic_worker_cleanup)
         if not 1 <= supervisor_stale_seconds <= supervisor_inactive_seconds <= supervisor_orphan_seconds <= 31_536_000:
             raise ValueError("supervisor lifecycle thresholds must be positive, ordered, and at most one year")
         self.supervisor_stale_seconds = supervisor_stale_seconds
@@ -64,8 +68,34 @@ class Engine:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=30000")
         self._schema()
+        resource_cleanup.initialize(self)
 
     def close(self): self.db.close()
+
+    def own_worker_resource(self, task_id: str, kind: str, path: str | Path, managed_root: str | Path):
+        """Record a worker-created resource with a filesystem identity snapshot."""
+        with self._lock:
+            return resource_cleanup.register(self, task_id, kind, path, managed_root)
+
+    def record_worker_process(self, task_id, attempt, generation, pid, pgid=None):
+        with self._lock:
+            return resource_cleanup.record_process(self, task_id, attempt, generation, pid, pgid)
+
+    def record_worker_process_exit(self, task_id, attempt, generation, pid, exit_code):
+        with self._lock:
+            return resource_cleanup.record_process_exit(self, task_id, attempt, generation, pid, exit_code)
+
+    def cleanup_worker_resources(self, task_id: str, *, execute: bool = False, retry: bool = False):
+        with self._lock:
+            return resource_cleanup.cleanup_task(self, task_id, execute=execute, retry=retry)
+
+    def verify_worker_inactive(self, task_id: str, attempt: int, evidence: str, generation: int | None = None):
+        with self._lock:
+            return resource_cleanup.verify_inactive(self, task_id, attempt, evidence, generation)
+
+    def authorize_worker_cleanup(self, task_id: str, attempt: int, evidence: str, generation: int | None = None):
+        with self._lock:
+            return resource_cleanup.authorize_cleanup(self, task_id, attempt, evidence, generation)
 
     def _schema(self):
         self.db.executescript("""
@@ -907,6 +937,8 @@ class Engine:
         except Exception:
             self.db.execute("ROLLBACK"); raise
         self.reconcile()
+        # Terminal callbacks never authorize deletion. The operator must record
+        # exact-attempt inactivity evidence, then request cleanup explicitly.
         return True
 
     def consume_receipt(self, event_id: str, token_id: str, *, expected_type: str, actor: str = "local-receipt") -> dict[str, Any]:
@@ -1021,6 +1053,11 @@ class Engine:
                     continue
                 self.db.execute("UPDATE workflows SET dispatch_count=dispatch_count+1,updated=? WHERE id=?", (now, workflow["id"]))
                 self._dispatch_count += 1
+                # Commit attempt classification with the durable dispatch
+                # ambiguity marker before opening the final launch fence.
+                classification = "dry_run" if self.dry_run else ("process_free" if getattr(self.worker, "process_free", False) is True else "intent")
+                self.db.execute("INSERT INTO worker_attempt_execution(task_id,attempt,generation,classification,updated,detail) VALUES(?,?,?,?,?,?) ON CONFLICT(task_id,attempt,generation) DO UPDATE SET classification=excluded.classification,updated=excluded.updated,detail=excluded.detail",
+                                (r["id"], r["attempts"], r["supervisor_generation"] or 1, classification, now, "explicit adapter process_free declaration" if classification == "process_free" else "durable pre-dispatch intent"))
                 # Persist ambiguity before crossing the process boundary. A hard
                 # supervisor crash after this point must never make the intent
                 # replayable, even if the launch-fence transaction rolls back.
@@ -1043,9 +1080,11 @@ class Engine:
                             self._terminate_workflow(workflow["id"], reason, now)
                     self.db.execute("COMMIT")
                     continue
-                task = {"id":r["id"], "attempt":r["attempts"], "idempotency_key":r["intent_key"], "project_id":r["project_id"], "project_root":r["root"],
+                task = {"id":r["id"], "attempt":r["attempts"], "generation":r["supervisor_generation"] or 1, "idempotency_key":r["intent_key"], "project_id":r["project_id"], "project_root":r["root"],
                         "intention":r["intention"], "read_only":bool(r["read_only"]), "write_authorized":bool(r["write_authorized"]), "dry_run":self.dry_run,
                         "project_snapshot":self.project_snapshot(r["project_id"]) }
+                # The classification above committed before opening this
+                # final launch fence; no missing PID row is treated as proof.
                 if not self.dry_run: self.worker.dispatch(task)
                 if self.fault_hook: self.fault_hook("after_external_dispatch")
                 self.db.execute("UPDATE dispatch_intents SET state='delivered',delivered=?,claimed=NULL WHERE task_id=? AND state='dispatching'", (self.clock(),r["id"]))
@@ -1068,6 +1107,10 @@ class Engine:
                 # the already committed dispatching marker and release the lock.
                 if self.db.in_transaction: self.db.execute("ROLLBACK")
                 raise
+        # Periodically retry only terminal attempts with durable explicit
+        # inactivity evidence. Ambiguous/orphaned tasks remain untouched.
+        with self._lock:
+            resource_cleanup.recover_verified(self, automatic=self.automatic_worker_cleanup)
         return dispatched
 
     def get_task(self, task_id):

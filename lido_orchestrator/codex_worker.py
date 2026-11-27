@@ -7,13 +7,13 @@ import shutil
 import subprocess
 import tempfile
 import threading
-import signal
 from pathlib import Path
 
 
 class CodexWorker:
     def __init__(self, *, enabled: bool = False, executable: str = "codex", timeout: int = 240,
-                 scratch_root: str | Path | None = None, event_sink=None):
+                 scratch_root: str | Path | None = None, event_sink=None, resource_register=None,
+                 process_started=None, process_exited=None):
         if not enabled or os.environ.get("LIDO_ENABLE_CODEX") != "1":
             raise RuntimeError("Codex execution requires enabled=True and LIDO_ENABLE_CODEX=1")
         if not 1 <= timeout <= 900: raise ValueError("timeout must be between 1 and 900 seconds")
@@ -21,6 +21,8 @@ class CodexWorker:
         if not resolved: raise FileNotFoundError(f"Codex CLI not found: {executable}")
         self.executable, self.timeout = resolved, timeout
         self.scratch_root, self.event_sink = scratch_root, event_sink
+        self.resource_register = resource_register
+        self.process_started, self.process_exited = process_started, process_exited
         self._threads = set()
         self._processes = set()
         self._task_processes = {}
@@ -49,15 +51,13 @@ class CodexWorker:
         with self._lock: processes = list(self._processes)
         for proc in processes:
             if proc.poll() is None:
-                try: os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError: pass
+                proc.terminate()
         with self._lock: threads = list(self._threads)
         for thread in threads: thread.join(timeout=2)
         with self._lock: processes = list(self._processes)
         for proc in processes:
             if proc.poll() is None:
-                try: os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError: pass
+                proc.kill()
         with self._lock: threads = list(self._threads)
         for thread in threads: thread.join(timeout=2)
 
@@ -67,12 +67,10 @@ class CodexWorker:
             proc = self._task_processes.get(task_id)
             self._cancelled_tasks.add(task_id)
         if proc is not None and proc.poll() is None:
-            try: os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError: pass
+            proc.terminate()
             try: proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
-                try: os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError: pass
+                proc.kill()
 
     def dispatch(self, task: dict):
         # Never pass project_root to Codex: the worker operates only in this empty scratch project.
@@ -80,9 +78,19 @@ class CodexWorker:
             if task["id"] in self._cancelled_tasks:
                 self._cancelled_tasks.discard(task["id"])
                 raise RuntimeError("task was cancelled before Codex launch")
-        scratch = tempfile.mkdtemp(prefix="lido-codex-", dir=self.scratch_root)
+        if self.resource_register is None:
+            managed_root = None
+            scratch = tempfile.mkdtemp(prefix="lido-codex-", dir=self.scratch_root)
+        else:
+            parent = Path(self.scratch_root or "/tmp").resolve(strict=True) if self.scratch_root else Path("/tmp")
+            if parent not in (Path("/tmp"), Path("/var/tmp")):
+                raise ValueError("Codex scratch parent must be /tmp or /var/tmp")
+            managed_root = Path(tempfile.mkdtemp(prefix="lido-worker-", dir=str(parent)))
+            scratch = tempfile.mkdtemp(prefix="workspace-", dir=str(managed_root))
         try:
             root = Path(scratch)
+            if self.resource_register:
+                self.resource_register(task["id"], "workspace", root, managed_root)
             snapshot = task.get("project_snapshot") or {"entries": [], "content_included": False}
             manifest = "\n".join(f"- {entry['kind']}: {entry['path']}" for entry in snapshot.get("entries", []))
             task_text = task["intention"].strip()
@@ -116,7 +124,12 @@ class CodexWorker:
             except OSError as exc:
                 raise RuntimeError(f"Codex could not be started: {exc}") from exc
 
+            launch_recorded = threading.Event()
             def collect():
+              # Do not process a fast exit until the PID is durably recorded.
+              # If registration fails, this gate still opens and the durable
+              # pre-launch intent remains ambiguous, so cleanup stays blocked.
+              launch_recorded.wait()
               try:
                 # Drain both pipes continuously while retaining only a bounded
                 # tail. This prevents a noisy CLI from filling memory or
@@ -124,31 +137,43 @@ class CodexWorker:
                 tails = {"stdout": bytearray(), "stderr": bytearray()}
                 limit = 65536
                 def drain(name, stream):
-                    while True:
-                        chunk = stream.read(8192)
-                        if not chunk: return
-                        tail = tails[name]; tail.extend(chunk)
-                        if len(tail) > limit: del tail[:-limit]
+                    try:
+                        while True:
+                            chunk = stream.read(8192)
+                            if not chunk: return
+                            tail = tails[name]; tail.extend(chunk)
+                            if len(tail) > limit: del tail[:-limit]
+                    finally:
+                        # Close from the owning reader thread, avoiding a
+                        # cross-thread close that could wait on its read lock.
+                        stream.close()
                 readers = [threading.Thread(target=drain, args=(name, stream), daemon=True)
                            for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr))]
                 for reader in readers: reader.start()
                 try:
                     proc.wait(timeout=self.timeout)
                 except subprocess.TimeoutExpired:
-                    try: os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError: pass
+                    # Popen methods target/recheck the exact child PID. Never
+                    # signal a PGID whose leader may have exited or been reused.
+                    proc.terminate()
+                    try: proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
                     proc.wait()
-                    for reader in readers: reader.join()
+                    if self.process_exited: self.process_exited(task["id"], task["attempt"], task.get("generation", 1), proc.pid, proc.returncode)
+                    # Descendants can retain pipe descriptors; don't wait for
+                    # those readers after the leader's timeout.
                     with self._lock: cancelled = task["id"] in self._cancelled_tasks
                     if cancelled: return
                     if self.event_sink:
                         self.event_sink(task["idempotency_key"] + f":attempt-{task['attempt']}:result", task["id"], "failed", {"error": "Codex task timed out", "attempt": task["attempt"]})
                     return
                 for reader in readers: reader.join(timeout=2)
+                if self.process_exited: self.process_exited(task["id"], task["attempt"], task.get("generation", 1), proc.pid, proc.returncode)
                 if any(reader.is_alive() for reader in readers):
                     # A stray descendant inherited a pipe after the CLI exited.
-                    try: os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError: pass
+                    # A completed leader does not prove its process group is
+                    # still ours; descendants or a reused PGID make signalling unsafe.
                     for reader in readers: reader.join(timeout=2)
                 stdout, stderr = (tails["stdout"].decode("utf-8", "replace"), tails["stderr"].decode("utf-8", "replace"))
                 with self._lock:
@@ -160,27 +185,45 @@ class CodexWorker:
                 payload = {**structured, "attempt": task["attempt"], "decision": structured.get("decision", "stop"),
                            "summary": structured.get("summary", result.stdout[-8000:]),
                            "stderr": result.stderr[-2000:], "exit_code": result.returncode, "scratch_project": True}
+                accepted = False
                 if self.event_sink:
-                    self.event_sink(task["idempotency_key"] + f":attempt-{task['attempt']}:result", task["id"], "completed" if result.returncode == 0 else "failed", payload)
+                    accepted = bool(self.event_sink(task["idempotency_key"] + f":attempt-{task['attempt']}:result", task["id"], "completed" if result.returncode == 0 else "failed", payload))
+                if accepted and result.returncode == 0 and managed_root is not None:
+                    try: managed_root.rmdir()
+                    except OSError: pass
                 if result.returncode:
                     return
               except Exception as exc:
-                if proc.poll() is None:
-                    try: os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError: pass
-                    proc.wait()
+                # Preserve resources and report the callback/collector fault.
+                # Do not signal by PGID after identity may have changed.
                 with self._lock: self._errors.append(str(exc))
               finally:
-                proc.stdout.close()
-                proc.stderr.close()
+                # A descendant may still own inherited descriptors. Do not let
+                # closing a buffered stream block collection indefinitely.
                 with self._lock: self._processes.discard(proc)
                 with self._lock: self._task_processes.pop(task["id"], None)
                 with self._lock: self._cancelled_tasks.discard(task["id"])
-                shutil.rmtree(scratch, ignore_errors=True)
+                # Once launched, descendants may outlive the leader or escape
+                # its session. Preserve scratch for later exact-attempt review.
                 with self._lock: self._threads.discard(threading.current_thread())
             thread = threading.Thread(target=collect, name="lido-codex-result", daemon=False)
             with self._lock: self._threads.add(thread)
             thread.start()
+            # The child and collector are owned before invoking fallible
+            # persistence callbacks. A callback fault cannot orphan either.
+            if self.process_started:
+                try:
+                    self.process_started(task["id"], task["attempt"], task.get("generation", 1), proc.pid, os.getpgid(proc.pid))
+                except Exception as exc:
+                    with self._lock: self._errors.append(str(exc))
+                    raise
+                finally:
+                    launch_recorded.set()
+            else:
+                launch_recorded.set()
         except Exception:
-            shutil.rmtree(scratch, ignore_errors=True)
+            # Popen may already have succeeded even when a launch callback
+            # fails. Managed artifacts remain available for exact-attempt review.
+            if 'proc' not in locals() and managed_root is None:
+                shutil.rmtree(scratch, ignore_errors=True)
             raise

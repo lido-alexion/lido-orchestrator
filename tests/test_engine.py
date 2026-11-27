@@ -8,6 +8,7 @@ import unittest
 import time
 import subprocess
 import sys
+import signal
 from unittest.mock import patch
 from pathlib import Path
 
@@ -57,6 +58,16 @@ class EngineTests(unittest.TestCase):
         child=[t for t in self.e.snapshot()["tasks"] if t["parent_task_id"]==tid][0]
         self.assertEqual("awaiting_approval",child["status"])
         self.assertEqual("succeeded",self.e.get_task(tid)["status"])
+
+    def test_worker_exception_leaves_durable_ambiguous_attempt_classification(self):
+        class AmbiguousWorker:
+            def dispatch(self, task): raise RuntimeError("fixture launch registration failure")
+        self.e.worker=AmbiguousWorker()
+        task=self.e.submit("demo","synthetic ambiguous launch",approval_required=False)
+        self.e.reconcile()
+        row=self.e.db.execute("SELECT classification,detail FROM worker_attempt_execution WHERE task_id=?",(task,)).fetchone()
+        self.assertEqual("intent",row["classification"])
+        self.assertEqual("needs_review",self.e.get_task(task)["status"])
     def test_dependent_steps_cannot_remove_approval_or_request_writes(self):
         tid=self.e.submit("demo","inspect",approval_required=False)
         self.e.reconcile()
@@ -526,7 +537,7 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual("stable:attempt-1:result",events[0][0])
                 self.assertEqual("completed",events[0][2])
                 self.assertEqual("continue",events[0][3]["decision"])
-                self.assertEqual([],list(Path(td).glob("lido-codex-*")))
+                self.assertEqual(1,len(list(Path(td).glob("lido-codex-*"))))
             finally:
                 if old is None: os.environ.pop("LIDO_ENABLE_CODEX",None)
                 else: os.environ["LIDO_ENABLE_CODEX"]=old
@@ -544,12 +555,36 @@ class EngineTests(unittest.TestCase):
             if old is None: os.environ.pop("LIDO_ENABLE_CODEX",None)
             else: os.environ["LIDO_ENABLE_CODEX"]=old
 
+    @unittest.skipUnless(os.name == "posix", "process smoke uses a POSIX executable")
+    def test_process_start_callback_fault_keeps_child_and_scratch_owned(self):
+        with tempfile.TemporaryDirectory() as td:
+            executable=Path(td)/"mock-codex"
+            executable.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(0)\n")
+            executable.chmod(0o755)
+            old=os.environ.get("LIDO_ENABLE_CODEX"); os.environ["LIDO_ENABLE_CODEX"]="1"
+            registered=[]
+            def started(*args): raise RuntimeError("fixture process ledger unavailable")
+            try:
+                worker=CodexWorker(enabled=True,executable=str(executable),timeout=5,scratch_root="/tmp",
+                    resource_register=lambda tid,kind,path,root: registered.append((Path(path),Path(root))),
+                    process_started=started)
+                with self.assertRaisesRegex(RuntimeError,"ledger unavailable"):
+                    worker.dispatch({"id":"task","attempt":1,"idempotency_key":"stable","intention":"harmless"})
+                self.assertEqual(1,len(worker._processes))
+                self.assertTrue(registered[0][0].exists())
+                with self.assertRaisesRegex(RuntimeError,"collection failed"):
+                    worker.wait(timeout=5)
+                self.assertTrue(registered[0][1].exists(), "managed scratch must survive callback failure")
+            finally:
+                if old is None: os.environ.pop("LIDO_ENABLE_CODEX",None)
+                else: os.environ["LIDO_ENABLE_CODEX"]=old
+
     @unittest.skipUnless(os.name == "posix", "process-tree smoke uses POSIX process groups")
-    def test_codex_worker_timeout_kills_process_tree_and_records_failure(self):
+    def test_codex_worker_timeout_stops_only_leader_and_preserves_escaped_descendant(self):
         with tempfile.TemporaryDirectory() as td:
             executable=Path(td)/"mock-codex"
             pidfile=Path(td)/"child.pid"
-            executable.write_text("#!/usr/bin/env python3\nimport subprocess,sys,pathlib,time,os\np=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])\npathlib.Path(os.environ['CHILD_PID_PATH']).write_text(str(p.pid))\ntime.sleep(30)\n")
+            executable.write_text("#!/usr/bin/env python3\nimport subprocess,sys,pathlib,time,os\np=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],start_new_session=True)\npathlib.Path(os.environ['CHILD_PID_PATH']).write_text(str(p.pid))\ntime.sleep(30)\n")
             executable.chmod(0o755)
             old=os.environ.get("LIDO_ENABLE_CODEX"); os.environ["LIDO_ENABLE_CODEX"]="1"
             old_pid=os.environ.get("CHILD_PID_PATH"); os.environ["CHILD_PID_PATH"]=str(pidfile)
@@ -561,11 +596,20 @@ class EngineTests(unittest.TestCase):
                 worker.wait(timeout=5)
                 self.assertEqual("failed",events[0][2])
                 child_pid=int(pidfile.read_text())
-                for _ in range(100):
-                    try: os.kill(child_pid,0)
-                    except ProcessLookupError: break
-                    time.sleep(.02)
-                else: self.fail("child process survived timeout cleanup")
+                # The adapter cannot prove ownership/quiescence of descendants
+                # after the leader exits, so it must not signal the process group.
+                try:
+                    os.kill(child_pid,0)
+                    descendant_alive=True
+                except ProcessLookupError:
+                    descendant_alive=False
+                if descendant_alive:
+                    os.kill(child_pid, signal.SIGTERM)
+                    for _ in range(100):
+                        try: os.kill(child_pid,0)
+                        except ProcessLookupError: break
+                        time.sleep(.02)
+                    else: self.fail("fixture descendant cleanup failed")
                 self.assertEqual(set(),worker._threads)
             finally:
                 if old is None: os.environ.pop("LIDO_ENABLE_CODEX",None)

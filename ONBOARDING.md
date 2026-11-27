@@ -90,3 +90,29 @@ python3.12 -m lido_orchestrator --db ./pilot.sqlite3 verify-receipt --receipt-ke
 ```
 
 For an isolated pilot, use a new temporary SQLite database, fixture-only config/key, and a fake SMTP transport. Run `python3.12 -m unittest discover -s tests -v`; the CLI pilot test uses a mocked SMTP client. Never use real credentials, mail, service state, production dispatch, or existing supervisor registrations in candidate verification. See [PROTOCOL.md](PROTOCOL.md) and [SECURITY.md](SECURITY.md).
+
+## Process-free resource cleanup
+
+Only use these trusted-local commands for resources already registered by an adapter. First inspect the task and resource identity, verify exact-attempt inactivity, and separately record that outputs and audit evidence are preserved:
+
+Registration accepts only the documented filesystem shapes. SQLite resources are registered as a containing directory; do not register or remove a standalone database or WAL/SHM/journal sidecar. If mount topology cannot be read, any mountpoint appears at the managed root or below it, kind and shape disagree, or workspace Git state includes ignored content, nested repositories, or unpreserved local refs, retain the resource for review.
+
+```sh
+python3.12 -m lido_orchestrator --db ./state.sqlite3 worker-resource-verify TASK_ID ATTEMPT GENERATION --evidence 'specific inactivity evidence'
+python3.12 -m lido_orchestrator --db ./state.sqlite3 worker-resource-authorize TASK_ID ATTEMPT GENERATION --evidence 'specific preservation decision'
+python3.12 -m lido_orchestrator --db ./state.sqlite3 worker-resource-cleanup TASK_ID
+python3.12 -m lido_orchestrator --db ./state.sqlite3 worker-resource-cleanup TASK_ID --execute
+```
+
+The first cleanup call is preview-only. Explicit execution still retains any resource whose durable execution classification is missing, ambiguous, or process-backed. Automatic cleanup is disabled unless the global `--automatic-worker-cleanup` option is supplied; even then, it is restricted to exact process-free attempts with both distinct records. No launched or ambiguous attempt can be cleaned. Set persisted bounds with `worker-resource-policy --retention-days DAYS --max-bytes BYTES`. These operations do not establish runtime write quotas or Codex process containment; see [CLEANUP_LIFECYCLE.md](CLEANUP_LIFECYCLE.md).
+
+For reusable trusted-local supervisor token handling, the included helper protects a private state directory and token file and supports enrollment, heartbeat, status, and deboarding:
+
+```sh
+python3.12 tools/supervisor-operator.py --db ./state.sqlite3 --state-dir ./private-supervisor-state enroll sup-demo PROJECT_ID WORKER_LABEL
+python3.12 tools/supervisor-operator.py --db ./state.sqlite3 --state-dir ./private-supervisor-state heartbeat sup-demo --generation 1
+python3.12 tools/supervisor-operator.py --db ./state.sqlite3 --state-dir ./private-supervisor-state status sup-demo
+python3.12 tools/supervisor-operator.py --db ./state.sqlite3 --state-dir ./private-supervisor-state deboard sup-demo
+```
+
+The helper stores the one-time route token in a mode-0600 file below a mode-0700 current-user-owned state directory. Protect and back up the SQLite database separately; the helper does not authenticate the local operator or alter the trusted-local security model.
