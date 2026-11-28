@@ -22,6 +22,10 @@ git diff --check
 
 Synthetic tests use temporary fixtures only. Package installation must pass in the normal disposable CI job before release acceptance.
 
+## Reconciliation observability
+
+Each CLI reconciliation cycle emits a fixed-schema JSON record to stderr. Records distinguish `reconcile` from `serve`, carry a fresh process-session UUID, use monotonic duration, and contain no task or error detail. Stdout JSON remains unchanged and telemetry failure is isolated from reconciliation. systemd journal capture and retention remain host-managed and may be unavailable or lossy; see the read-only inspection procedure in `README.md` and synthetic coverage in `tests/test_periodic_cli.py`.
+
 ## Deployment guidance and periodic acceptance
 
 The README documents revision-pinned isolated installation with explicit preflight guards, a reviewed offline build wheelhouse, and operator-assisted SQLite backup and recovery. It does not automate restore or service replacement. The example user unit remains dry-run; its revision placeholder must be resolved by the operator. Synthetic tests exercise an actual periodic CLI loop on disposable state and document guard behavior. Package installation, deployment and persistent-service behavior still require their own acceptance evidence.

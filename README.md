@@ -22,6 +22,27 @@ python3.12 -m lido_orchestrator --db ./lido.sqlite3 outbox
 
 Submissions require explicit approval by default. Each root task starts a durable workflow with a default maximum of 8 total tasks, depth 3, and a one-hour deadline. An embedding caller can set smaller or larger bounded values with `Engine.submit(..., workflow_budget=..., workflow_max_depth=..., workflow_timeout=...)`. Task count and dispatch attempts are stored in SQLite and survive restart; `reconcile --max-tasks N` is an additional per-invocation ceiling, not the workflow safety limit. A proposal that exceeds the task or depth budget terminates the workflow and cancels queued descendants. `stop`, `needs_review`, worker failure, lease ambiguity, and deadline expiry also terminate the workflow. Termination fences late events, asks a process-aware adapter to cancel running siblings, and moves any uncancellable/ambiguous dispatch to `needs_review`. Operators can cancel one workflow with `terminate-workflow WORKFLOW_ID --reason 'operator review'`. `serve` repeats local reconciliation every five minutes by default (configurable); this local loop is independent of any external supervisor wake schedule. A one-shot waits for local adapter callbacks. Default dry-run tasks finish in the explicit `dry_run` state and never invoke an adapter. Use `stop on` to block new claims and `stop off` to resume. There is no CLI event injection command or network listener. Backups should use SQLite's online backup API or include the database and its WAL state.
 
+Each `reconcile` or `serve` cycle writes one fixed-schema JSON record to stderr. The record contains `event`, `schema_version`, a process-session UUID, cycle number, source (`reconcile` or `serve`), outcome, monotonic duration in nanoseconds, and claimed-task count when reconciliation returns (otherwise `null`). Duration is `null` if the monotonic clock is unavailable; the session ID is `unavailable` if UUID generation fails. It omits task, project, worker, event, database, and error details. Successful one-shot command JSON remains on stdout. A new process has a new session UUID; gaps or absent records do not prove that reconciliation did not run. Telemetry is best effort: stderr write or formatting failures are ignored and cannot alter reconciliation results or errors.
+
+For a systemd user unit, stderr is normally collected by the journal. Availability, persistence across reboot, and retention depend on the host's journald configuration and storage policy; Lido does not create a separate log file, database, or retention policy. Journald may be volatile, rate-limited, vacuumed, or unavailable, so logs are operational evidence only and are not part of the authoritative task/audit state. A read-only acceptance check for an already running user unit is:
+
+```sh
+journalctl --user -u lido-orchestrator.service --since '30 minutes ago' --output=cat \
+  | python3.12 -c '
+import json, sys
+fields = ("event", "schema_version", "session_id", "cycle", "source", "outcome", "duration_ns", "claimed_count")
+for line in sys.stdin:
+    try:
+        row = json.loads(line)
+    except (ValueError, TypeError):
+        continue
+    if row.get("event") == "reconciliation_cycle":
+        print(json.dumps({key: row[key] for key in fields}))
+'
+```
+
+Confirm sequential cycle numbers within each observed session and `serve` as the source for periodic cycles. Distinct session IDs indicate distinct CLI processes when records are present; journal retention gaps prevent a complete restart history. This reads journal output only and does not inspect or modify service state. Synthetic candidate acceptance is covered by `tests/test_periodic_cli.py` using disposable SQLite state.
+
 ## Integration contract
 
 An adapter receives task identity, an idempotency key, project metadata, intention, and access mode. SQLite creates a durable dispatch intent in the same transaction that claims a task. A second supervisor atomically claims each pending intent. An unclaimed pending intent can recover after a crash; once a real dispatch might have started, lease expiry fails closed into `needs_review` instead of replaying it. Event IDs are unique and duplicates are ignored. Structured completion payloads accept `decision` (`continue`, `stop`, or `needs_review`) plus up to ten `next_steps`; descendants share their parent's durable workflow, task budget, depth and deadline. Generated work defaults to approval-required and read-only. The existing preapproved-read-only option remains an explicit opt-in and is disabled by default. A model cannot grant write authority to a child.

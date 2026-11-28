@@ -1,11 +1,52 @@
 from __future__ import annotations
-import argparse, json, os, time, sys
+import argparse, json, os, time, sys, uuid
 import hashlib, hmac, secrets
 from dataclasses import replace
 from .engine import Engine
 from .codex_worker import CodexWorker
 from .smtp_delivery import SMTPOutboxAdapter, load_config, load_receipt_key, verify_receipt
 from . import resource_cleanup
+
+
+def _new_session_id() -> str:
+    try:
+        return str(uuid.uuid4())
+    except BaseException:
+        return "unavailable"
+
+
+def _reconcile_cycle(engine, *, source: str, session_id: str, cycle: int) -> list[str]:
+    """Run one cycle and emit bounded operational telemetry without affecting it."""
+    try:
+        started = time.monotonic_ns()
+    except BaseException:
+        started = None
+    outcome = "success"
+    claimed_count = None
+    try:
+        claimed = engine.reconcile()
+        claimed_count = len(claimed)
+        return claimed
+    except BaseException:
+        outcome = "error"
+        raise
+    finally:
+        try:
+            record = {
+                "event": "reconciliation_cycle",
+                "schema_version": 1,
+                "session_id": session_id,
+                "cycle": cycle,
+                "source": source,
+                "outcome": outcome,
+                "duration_ns": max(0, time.monotonic_ns() - started) if started is not None else None,
+                "claimed_count": claimed_count,
+            }
+            sys.stderr.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
+            sys.stderr.flush()
+        except BaseException:
+            # Telemetry is best effort; it must not change reconciliation behavior.
+            pass
 
 def main(argv=None):
     p=argparse.ArgumentParser(prog="lido",description="Local durable Codex supervisor (dry-run by default)",allow_abbrev=False)
@@ -126,7 +167,7 @@ def main(argv=None):
         elif args.cmd=="reconcile":
             if not 1<=args.max_tasks<=Engine.MAX_WORKFLOW_TASKS: p.error("--max-tasks must be between 1 and 100")
             engine.max_dispatches=args.max_tasks
-            claimed=engine.reconcile()
+            claimed=_reconcile_cycle(engine, source="reconcile", session_id=_new_session_id(), cycle=1)
             if worker is not None:
                 worker.wait()
             out={"claimed":claimed}
@@ -146,8 +187,11 @@ def main(argv=None):
             if args.once:
                 if not 1<=args.max_tasks<=Engine.MAX_WORKFLOW_TASKS: p.error("--max-tasks must be between 1 and 100")
                 engine.max_dispatches=args.max_tasks
+            session_id = _new_session_id()
+            cycle = 0
             while True:
-                engine.reconcile()
+                cycle += 1
+                _reconcile_cycle(engine, source="serve", session_id=session_id, cycle=cycle)
                 if args.once:
                     # The callback itself reconciles immediate dependent work.
                     # wait() drains that callback chain without starting a fresh
